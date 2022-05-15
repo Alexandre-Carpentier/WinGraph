@@ -11,8 +11,8 @@ VOID InitGL(HGRAPH hGraph, int Width, int Height);
 VOID SetGLView(int Width, int Height);
 VOID CheckErr(VOID);
 
-GLvoid BuildFont(HGRAPH hGraph);
-GLvoid KillFont(GLvoid);
+BOOL BuildMyFont(HGRAPH hGraph, char* FontName, int Fontsize);
+void KillFont(GLvoid);
 GLvoid glPrint(const char* fmt, ...);
 
 BOOL FindGlobalMaxScale(HGRAPH hGraph, float& Xmin, float& Xmax, float& Ymin, float& Ymax);
@@ -599,8 +599,8 @@ VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
 		return;
 	}
 
-	// If the maximum points are reach 
-	// in the buffer, shift left the array
+	// If the maximum points are reached 
+	// in the buffer, shift left the array and
 	// dec the current number of points
 
 	if (pgraph->cur_nbpoints == pgraph->BufferSize)
@@ -654,9 +654,11 @@ VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
 	{
 		fprintf(logfile, "\n");
 	}
-	pgraph->cur_nbpoints++;
 
 	// Inc the number of points
+
+	pgraph->cur_nbpoints++;
+
 	LeaveCriticalSection(&cs);
 }
 
@@ -682,15 +684,14 @@ BOOL Render(HGRAPH hGraph)
 
 		//long long t1 = PerformanceCounter(); //DBG
 
-		UpdateBorder(hGraph); // DBG: Y display overflow
-		//update_border(hGraph);																			// border determination for each signal: meaning finding X and Y min max values
+		UpdateBorder(hGraph);																			// border determination for each signal: meaning finding X and Y min max values																		
 		//DATA** sig = pgraph->signal; //DBG
 
 		//long long t2 = PerformanceCounter(); //DBG
 		//double freq = (double)((t2 - t1)) / frequency * 1000; //DBG
 		//printf("\rupdate_border take: %lf ms\r", freq); //DBG
 
-		//memset(SnapPlot, 0, sizeof(DATA));																// Reset computing datas
+		//memset(SnapPlot, 0, sizeof(DATA));															// Reset computing datas
 		ZeroObject(hGraph, SnapPlot);
 		FindGlobalMaxScale(hGraph, SnapPlot->Xmin, SnapPlot->Xmax, SnapPlot->Ymin, SnapPlot->Ymax);		// Finding the Y min and max of all the signals to scale on ite
 		normalize_data(hGraph, SnapPlot->Xmin, SnapPlot->Xmax, SnapPlot->Ymin, SnapPlot->Ymax);			// normalize between [0;1]
@@ -894,11 +895,13 @@ VOID ReshapeGraph(HGRAPH hGraph, int left, int top, int right, int bottom)
 	InitGL: Setup the font used, set the correct OpenGL view at init
   -------------------------------------------------------------------------*/
 
-VOID InitGL(HGRAPH hGraph, int Width, int Height)    // Called after the main window is created
+VOID InitGL(HGRAPH hGraph, int Width, int Height)		// Called after the main window is created
 {
-	glShadeModel(GL_SMOOTH);                // Enable Smooth Shading
-	BuildFont(hGraph);                        // Build The Font
-
+	glShadeModel(GL_SMOOTH);							// Enable Smooth Shading
+	if (!BuildMyFont(hGraph, (char*)"Verdana", 12))// Build The Font BuildMyFont(HGRAPH hGraph, char* FontName, int Fontsize)
+	{
+		// error on creating the Font
+	}
 	SetGLView(Width, Height);
 }
 
@@ -914,52 +917,65 @@ VOID SetGLView(int Width, int Height)
 }
 
 /*-------------------------------------------------------------------------
-	BuildFont: Create a Windows Bitmap font to write the device context with
+	BuildFont: Create a Windows Bitmap Font to write the device context with
   -------------------------------------------------------------------------*/
-  //https://nehe.gamedev.net/tutorial/bitmap_fonts/17002/
 
-GLvoid BuildFont(HGRAPH hGraph)
+BOOL BuildMyFont(HGRAPH hGraph, char * FontName, int Fontsize)
 {
-	HFONT   font;															// Windows Font ID
-	HFONT   oldfont;														// Used For Good House Keeping
+	HFONT hCustomFont = NULL;									// New font to create
+	HFONT hCurrentFont = NULL;									// Store the current Windows font
 
-	base = glGenLists(96);													// Storage For 96 Characters ( NEW )
+	// Create an empty display list of 96 char (We are using ASCII char from 32 to 127 only)
 
-	font = CreateFont(-12,													// Height Of Font ( NEW )
-		0,																	// Width Of Font
-		0,																	// Angle Of Escapement
-		0,																	// Orientation Angle
-		FW_NORMAL,															// Font Weight
-		FALSE,																// Italic
-		FALSE,																// Underline
-		FALSE,																// Strikeout
-		ANSI_CHARSET,														// Character Set Identifier
-		OUT_TT_PRECIS,														// Output Precision
-		CLIP_DEFAULT_PRECIS,												// Clipping Precision
-		ANTIALIASED_QUALITY,												// Output Quality
-		FF_DONTCARE | DEFAULT_PITCH,										// Family And Pitch
-		"Verdana");         // Font Name
-	oldfont = (HFONT)SelectObject(GetGraphDC(hGraph), font);				// Selects The Font We Want
-	wglUseFontBitmaps(GetGraphDC(hGraph), 32, 96, base);					// Builds 96 Characters Starting At Character 32
-	SelectObject(GetGraphDC(hGraph), oldfont);								// Selects The Font We Want
+	base = glGenLists(96);	
+	if (0 == base)
+	{
+		// error when generate the empty list
+		return FALSE;
+	}
 
-	// Badly retrieving the length in pixel of "-0.0000" string for sizing purpose: to be check
-	///////////////////////////////////////////////////////////////////////////////////////////
+	hCustomFont = CreateFont(-1 * Fontsize,						// Font size
+		0,														// Width Of Font
+		0,														// Angle Of Escapement
+		0,														// Orientation Angle
+		FW_NORMAL,												// Font Weight
+		FALSE,													// Italic
+		FALSE,													// Underline
+		FALSE,													// Strikeout
+		ANSI_CHARSET,											// Character Set Identifier
+		OUT_TT_PRECIS,											// Output Precision
+		CLIP_DEFAULT_PRECIS,									// Clipping Precision
+		ANTIALIASED_QUALITY,									// Output Quality
+		FF_DONTCARE | DEFAULT_PITCH,							// Family And Pitch
+		FontName);												// Font Name
+
+	if (NULL == hCustomFont)
+	{
+		// error when creating the font
+		return FALSE;
+	}
+
+	hCurrentFont = (HFONT)SelectObject(GetGraphDC(hGraph), hCustomFont);// Select the custom Font and store the current font
+
+	if (!wglUseFontBitmaps(GetGraphDC(hGraph), 32, 96, base))		// Builds 96 Characters Starting At Character 32 and store it in the list
+	{
+		// error when loading the font
+		return FALSE;
+	}
 	char text[] = "-0.0000";
-	SelectObject(GetGraphDC(hGraph), font);
 	SetTextCharacterExtra(GetGraphDC(hGraph), 1);
 	GetTextExtentPoint32A(GetGraphDC(hGraph), text, strlen(text), &dispStringWidth);
 	dispStringWidth.cx -= GetTextCharacterExtra(GetGraphDC(hGraph)) * (strlen(text) - 2);
-	///////////////////////////////////////////////////////////////////////////////////////////
-	DeleteObject(font);														// Delete The Font
+
+	SelectObject(GetGraphDC(hGraph), hCurrentFont);				// restore the initial Font
+	DeleteObject(hCustomFont);									// We don't need the Custom Font anymore as we populate the list and load it in OpenGL
 }
 
 /*-------------------------------------------------------------------------
 	KillFont: Free the font from OpenGL
   -------------------------------------------------------------------------*/
-  //https://nehe.gamedev.net/tutorial/bitmap_fonts/17002/
 
-GLvoid KillFont(GLvoid)														// Delete The Font List
+void KillFont(GLvoid)														// Delete The Font List
 {
 	glDeleteLists(base, 96);												// Delete All 96 Characters ( NEW )
 }
@@ -1260,7 +1276,8 @@ VOID normalize_data(HGRAPH hGraph, float Xmin, float Xmax, float Ymin, float Yma
 }
 
 /*-------------------------------------------------------------------------
-	UpdateBorder: Update the min and max value of every signal object
+	UpdateBorder: Update the min and max value of every signal object 
+	in the struct.
   -------------------------------------------------------------------------*/
 VOID UpdateBorder(HGRAPH hGraph)
 {
