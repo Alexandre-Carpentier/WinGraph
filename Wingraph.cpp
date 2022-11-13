@@ -1,4 +1,4 @@
-#include "graph.h"
+#include "WinGraph.h"
 // Private declarations goes here
 #pragma comment (lib, "gdi32.lib")
 #pragma comment (lib, "User32.lib")
@@ -35,6 +35,7 @@ inline long long PerformanceFrequency();
 inline long long PerformanceCounter();
 
 typedef struct {
+	char signame[64];
 	float *X;
 	float *Y;
 	float *Xnorm;
@@ -451,6 +452,22 @@ HGRAPH CreateGraph(HWND hWnd, RECT GraphArea, INT SignalCount, INT BufferSize )
 	GetClientRect(pgraph->hGraphWnd, &DispArea);
 	InitGL(pgraph, DispArea.right, DispArea.bottom);
 	return pgraph;
+}
+
+/*-------------------------------------------------------------------------
+	SetSignalLabel: set a name to a signal
+  -------------------------------------------------------------------------*/
+
+VOID SetSignalLabel(HGRAPH hGraph, CONST CHAR *lpszLabel, INT iSignalNumber)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	if (NULL == pgraph)
+		return;
+
+	iSignalNumber--; // Signal number [0-15]
+
+	DATA* signal = (DATA*)pgraph->signal[iSignalNumber];
+	strncpy_s(signal->signame, lpszLabel, 64);
 }
 
 /*-------------------------------------------------------------------------
