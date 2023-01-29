@@ -58,6 +58,11 @@ typedef struct {
 	INT BufferSize;								// The total amount of point to handle							
 	BOOL bRunning;								// Status of the graph
 	BOOL bLogging;								// Logging active
+	BOOL bFiltering;							// Filtering active
+	BOOL bAutoscale;							// Autoscale active
+	float ymin_fix;								// Fix the Y min val
+	float ymax_fix;								// Fix the Y max val
+	float xwindow_fix;							// Fix the time windows val
 	DATA* signal[];								// ! (flexible array member) Array of pointers for every signal to be store by the struct - Must be last member of the struct
 }GRAPHSTRUCT, * PGRAPHSTRUCT;					// Declaration of the struct. To be cast from HGRAPH api
 
@@ -206,7 +211,7 @@ VOID StopGraph(HGRAPH hGraph)
 	// Update status -> Graph OFF
 
 	pgraph->bRunning = FALSE;
-	pgraph->cur_nbpoints = 0;
+	//pgraph->cur_nbpoints = 0; ACA
 
 }
 
@@ -248,6 +253,7 @@ VOID FreeGraph(HGRAPH hGraph)
 		wglDeleteContext(pgraph->hRC);
 		ReleaseDC(pgraph->hParentWnd, pgraph->hDC);
 		free(pgraph);
+		pgraph = NULL;
 
 		if (SnapPlot)
 		{
@@ -273,8 +279,10 @@ VOID FreeGraph(HGRAPH hGraph)
 			logfile = NULL;
 		}
 
-		pgraph = NULL;
+		
 		DeleteCriticalSection(&cs);
+
+		hGraph = NULL;
 
 	}
 }
@@ -448,6 +456,7 @@ HGRAPH CreateGraph(HWND hWnd, RECT GraphArea, INT SignalCount, INT BufferSize )
 		PostQuitMessage(0);
 		return NULL;
 	}
+	pgraph->bAutoscale = true;
 	pgraph->bLogging = false;
 	GetClientRect(pgraph->hGraphWnd, &DispArea);
 	InitGL(pgraph, DispArea.right, DispArea.bottom);
@@ -481,6 +490,74 @@ VOID SetRecordingMode(HGRAPH hGraph, BOOL logging)
 		return;
 
 	pgraph->bLogging = logging;
+}
+
+/*-------------------------------------------------------------------------
+	SetAutoscaleMode: set autoscale
+  -------------------------------------------------------------------------*/
+
+VOID SetAutoscaleMode(HGRAPH hGraph, BOOL mode)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	if (NULL == pgraph)
+		return;
+
+	pgraph->bAutoscale = mode;
+
+	if (mode == FALSE)
+	{
+		if (pgraph->bRunning)
+		{
+			DATA* pData = NULL;
+			pData = (DATA * )pgraph->signal[0];
+
+			// TODO Check every signal not just once
+			// only chan 1 is evaluated
+			pgraph->ymax_fix = pData->Ymax;
+			pgraph->ymin_fix = pData->Ymin;
+			pgraph->xwindow_fix = pData->X[pgraph->cur_nbpoints-1];
+		}
+		
+	}
+}
+
+/*-------------------------------------------------------------------------
+	SetYminVal: set the Ymin scale value
+  -------------------------------------------------------------------------*/
+
+VOID SetYminVal(HGRAPH hGraph, FLOAT ymin)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	if (NULL == pgraph)
+		return;
+
+	pgraph->ymin_fix = ymin;
+}
+
+/*-------------------------------------------------------------------------
+	SetYmaxVal: set the Ymin scale value
+  -------------------------------------------------------------------------*/
+
+VOID SetYmaxVal(HGRAPH hGraph, FLOAT ymax)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	if (NULL == pgraph)
+		return;
+
+	pgraph->ymax_fix = ymax;
+}
+
+/*-------------------------------------------------------------------------
+	SetFilteringMode: set the EMA filtering state
+  -------------------------------------------------------------------------*/
+
+VOID SetFilteringMode(HGRAPH hGraph, BOOL filtering)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	if (NULL == pgraph)
+		return;
+
+	pgraph->bFiltering = filtering;
 }
 
 /*-------------------------------------------------------------------------
@@ -588,6 +665,35 @@ INT GetGraphSignalCount(HGRAPH hGraph)
 	return pgraph->signalcount;
 }
 
+/*-------------------------------------------------------------------------
+	GetGraphSignalNumber: return the total signals number
+  -------------------------------------------------------------------------*/
+
+FLOAT GetGraphLastSignalValue(HGRAPH hGraph, INT SIGNB)
+{
+	// Sanity check
+
+	if (NULL == hGraph)
+		return NULL;
+
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	if (NULL == pgraph->signalcount)
+		return NULL;
+	EnterCriticalSection(&cs);
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints > 0)
+	{
+		LeaveCriticalSection(&cs);
+		return pData->Y[pgraph->cur_nbpoints - 1];
+	}
+	else
+	{
+		LeaveCriticalSection(&cs);
+	}
+		return 0.0f;
+}
+
 
 VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
 {
@@ -658,7 +764,19 @@ VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
 			return;
 		}
 
-		// Add points to the selected buffer	
+			// Low pass filter
+
+		if (pgraph->bFiltering == true)
+		{
+			float a = 0.1; // Custom cut freq 
+
+			if (pgraph->cur_nbpoints == 0)
+				y[index] = y[index]; // First point skip to prevent INF
+			else
+				y[index] = a * y[index] + (1 - a) * pDATA->Y[pgraph->cur_nbpoints - 1]; // Low pass filter EMA "f(x) = x1 * a + (1-a) * x0" where a [0;1]
+		}
+			
+			// Add points to the selected buffer	
 
 		pDATA->X[pgraph->cur_nbpoints] = (float)((finish - start)) / frequency;								// Save in X the elapsed time from start
 		pDATA->Y[pgraph->cur_nbpoints] = y[index];															// Save Y
@@ -1324,8 +1442,20 @@ VOID UpdateBorder(HGRAPH hGraph)
 		{
 			pgraph->signal[index]->Xmin = TakeFiniteNumber(pgraph->signal[index]->X[AnalizedPts]);
 			pgraph->signal[index]->Xmax = TakeFiniteNumber(pgraph->signal[index]->X[AnalizedPts]);
-			pgraph->signal[index]->Ymin = TakeFiniteNumber(pgraph->signal[index]->Y[AnalizedPts]);
-			pgraph->signal[index]->Ymax = TakeFiniteNumber(pgraph->signal[index]->Y[AnalizedPts]);
+			//pgraph->BufferSize = 50;
+			
+			if (pgraph->bAutoscale == TRUE)
+			{
+				pgraph->signal[index]->Ymin = TakeFiniteNumber(pgraph->signal[index]->Y[AnalizedPts]);
+				pgraph->signal[index]->Ymax = TakeFiniteNumber(pgraph->signal[index]->Y[AnalizedPts]);
+			}
+			else
+			{
+				pgraph->signal[index]->Ymin = pgraph->ymin_fix;
+
+				pgraph->signal[index]->Ymax = pgraph->ymax_fix;
+			}
+
 		}
 	}
 
@@ -1364,7 +1494,6 @@ VOID UpdateBorder(HGRAPH hGraph)
 			for (CurrentPoint; CurrentPoint < pgraph->cur_nbpoints; CurrentPoint++)
 			{
 				pgraph->signal[index]->Xmin = TakeFiniteNumber(pgraph->signal[index]->X[0]);
-
 
 				if (TakeFiniteNumber(pgraph->signal[index]->X[CurrentPoint]) > pgraph->signal[index]->Xmax)
 				{
