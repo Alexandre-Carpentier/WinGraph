@@ -1,11 +1,18 @@
 #include "WinGraph.h"
-// Private declarations goes here
+#include "xlsx.h"
+#include "Mouse.h"
+#include "math.h"
+#include "datetimeapi.h"
+#include "fileapi.h"
+
 #pragma comment (lib, "gdi32.lib")
 #pragma comment (lib, "User32.lib")
 #pragma comment (lib, "Opengl32.lib")
 #pragma comment (lib, "Glu32.lib")
 
-enum { MAX_SIGNAL_COUNT = 16 };
+// Private declarations goes here
+
+enum { MAX_SIGNAL_COUNT = 64 };
 
 VOID InitGL(HGRAPH hGraph, int Width, int Height);
 VOID SetGLView(int Width, int Height);
@@ -15,7 +22,7 @@ BOOL BuildMyFont(HGRAPH hGraph, char* FontName, int Fontsize);
 void KillFont(GLvoid);
 GLvoid glPrint(const char* fmt, ...);
 
-BOOL FindGlobalMaxScale(HGRAPH hGraph, float& Xmin, float& Xmax, float& Ymin, float& Ymax);
+BOOL FindGlobalMaxScale(HGRAPH hGraph, double& Xmin, double& Xmax, double& Ymin, double& Ymax);
 VOID DrawWave(HGRAPH hGraph);
 VOID DrawString(float x, float y, char* string);
 VOID DrawGraphSquare(VOID);
@@ -23,57 +30,76 @@ VOID DrawGridLines(VOID);
 VOID DrawCursor(float x, float y);
 
 
-inline float TakeFiniteNumber(float x);
-float FindFirstFiniteNumber(float* tab, int length);
-LPSTR ftos(LPSTR str, int len, float value);
-float GetStandardizedData(float X, float min, float max);
-VOID normalize_data(HGRAPH hGraph, float Xmin, float Xmax, float Ymin, float Ymax);
+inline double TakeFiniteNumber(double x);
+double FindFirstFiniteNumber(double* tab, int length);
+LPSTR dtos(LPSTR str, int len, double value);
+double GetStandardizedData(double X, double min, double max);
+VOID normalize_data(HGRAPH hGraph, double Xmin, double Xmax, double Ymin, double Ymax);
 VOID UpdateBorder(HGRAPH hGraph);
+INT GetBufferSize(HGRAPH hGraph);
+BOOL GetUniqueFilename(CHAR* lpFilename, CHAR* lpFileExtension);
 
 
 inline long long PerformanceFrequency();
 inline long long PerformanceCounter();
 
 typedef struct {
-	char signame[64];
-	float *X;
-	float *Y;
-	float *Xnorm;
-	float *Ynorm;
-	float Xmin;
-	float Xmax;
-	float Ymin;
-	float Ymax;
+	double period_s;
+	double min_value;
+	double max_value;
+	INT average_value_counter;
+	double average_value_accumulator;
+	double average_value;
+}DATA_STATISTIC;
+
+typedef struct {
+	char signame[260];
+	float color[3];
+	bool show;
+	DATA_STATISTIC stat;
+	double*X;
+	double*Y;
+	double*Xnorm;
+	double*Ynorm;
+	double Xmin;
+	double Xmax;
+	double Ymin;
+	double Ymax;
+	double Yaverage;
 }DATA;
 
-VOID ZeroObject(HGRAPH hGraph, DATA* pDATA);
+VOID ZeroObject(DATA* pDATA, INT iBufferSize);
 #pragma warning(disable : 4200)					// Disable warning: DATA* signal[] -> Array size [0], See CreateGraph for signal allocation specifics
 typedef struct {
 	HWND hParentWnd;							// Parent handle of the object
 	HWND hGraphWnd;								// Graph handle
 	HDC hDC;									// OpenGL device context
 	HGLRC hRC;									// OpenGL rendering context
-	INT signalcount;							// Total signals in the struct
+	INT totalsignalcount;						// Total signals in the struct
+	INT signalcount;							// signals in use in the struct
 	INT cur_nbpoints;							// Current total points in the arrays
 	INT BufferSize;								// The total amount of point to handle							
 	BOOL bRunning;								// Status of the graph
-	BOOL bLogging;								// Logging active
-	BOOL bFiltering;							// Filtering active
+	LOGGER_M Logging;							// Logging type
+	FILTER_M Filtering;							// Filtering type
 	BOOL bAutoscale;							// Autoscale active
-	float ymin_fix;								// Fix the Y min val
-	float ymax_fix;								// Fix the Y max val
-	float xwindow_fix;							// Fix the time windows val
+	BOOL bDisplayCursor;						// Logging active
+	double ymin_fix;							// Fix the Y min val
+	double ymax_fix;							// Fix the Y max val
+	int scale_factor;						// Fix the X scale factor (zoom)
+	double xwindow_fix;							// Fix the time windows val
 	DATA* signal[];								// ! (flexible array member) Array of pointers for every signal to be store by the struct - Must be last member of the struct
 }GRAPHSTRUCT, * PGRAPHSTRUCT;					// Declaration of the struct. To be cast from HGRAPH api
 
-// Global access
+	// Global access
 
 DATA* SnapPlot;									// SnapPlot: work with temp data on signals[], used to convert standard values to normalized values
 RECT DispArea;									// RECT struct for the OpenGL area dimensions stored in WinProc
 GLuint  base;                                   // Base Display List For The Font Set
 SIZE dispStringWidth;							// The size  in pixel of "-0.000" displayed on screen
 CRITICAL_SECTION cs;							// Sync purpose
-FILE* logfile;									// The log file
+FILE* logfile;									// The ascii log file
+HEXCEL XL;										// The xlsx log file
 INT runonce;									// Used by UpdateBorder
 
 	// High precision time measurements
@@ -89,7 +115,7 @@ PIXELFORMATDESCRIPTOR pfd =
 	1,                                          // Version Number (?)
 	PFD_DRAW_TO_WINDOW |                        // Format Must Support Window
 	PFD_SUPPORT_OPENGL |						// Format Must Support OpenGL
-	PFD_DOUBLEBUFFER,							// Must Support Double Buffering
+	PFD_DOUBLEBUFFER,							// Must Support double Buffering
 	PFD_TYPE_RGBA,								// Request An RGBA Format
 	32,											// Select A 32Bit Color Depth
 	0, 0, 0, 0, 0, 0,							// Color Bits Ignored (?)
@@ -129,59 +155,116 @@ BOOL APIENTRY DllMain(HANDLE hModule, DWORD ul_reason_for_call,
 
 BOOL StartGraph(HGRAPH hGraph)
 {
+		// Sanity check
+
+	if (NULL == hGraph)
+	{
+		printf("[!] Error at StartGraph() graph handle is null\n");
+		return FALSE;
+	}
+
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
 	DATA* pDATA;
 
-	// Sanity check
+		// Sanity check
 
-	if (NULL == pgraph || TRUE == pgraph->bRunning)
+	if (TRUE == pgraph->bRunning)
+	{
+		printf("[!] Error at StartGraph() graph already running\n");
 		return FALSE;
+	}
+		
 
-	// reset counters and data array of signals
+	EnterCriticalSection(&cs);
+
+		// reset counters and data array of signals
 
 	pgraph->cur_nbpoints = 0;
 	for (int index = 0; index < pgraph->signalcount; index++)
 	{
 		pDATA = pgraph->signal[index];
-		memset(pDATA->X, 0, sizeof(float)* pgraph->BufferSize);
-		memset(pDATA->Y, 0, sizeof(float) * pgraph->BufferSize);
-		memset(pDATA->Xnorm, 0, sizeof(float) * pgraph->BufferSize);
-		memset(pDATA->Ynorm, 0, sizeof(float) * pgraph->BufferSize);
+		memset(pDATA->X, 0, sizeof(double)* pgraph->BufferSize);
+		memset(pDATA->Y, 0, sizeof(double) * pgraph->BufferSize);
+		memset(pDATA->Xnorm, 0, sizeof(double) * pgraph->BufferSize);
+		memset(pDATA->Ynorm, 0, sizeof(double) * pgraph->BufferSize);
 		pDATA->Xmin = 0.0f;
 		pDATA->Xmax = 0.0f;
 		pDATA->Ymin = 0.0f;
 		pDATA->Ymax = 0.0f;
+		pDATA->show = true;
 	}
 
-	// Save the start time x=0
+		// Create the log file
+
+	if (pgraph->Logging == LOGGER_ASCII)
+	{
+		logfile = NULL;
+
+			// create unique filename
+
+		char lpDateStr[MAX_PATH] = "";
+		if (!GetUniqueFilename(lpDateStr, (char*)".lab"))
+		{
+			MessageBox(GetFocus(), "Error: impossible to generate an unique filename in the current directory", "Error", MB_ICONERROR);
+			LeaveCriticalSection(&cs);
+			return FALSE;
+		}
+
+			// try to open the file
+
+		fopen_s(&logfile, lpDateStr, "w+");
+		if (!logfile)
+		{
+			MessageBox(GetFocus(), "Error: impossible to read/write the file", "Error", MB_ICONERROR);
+			LeaveCriticalSection(&cs);
+			return FALSE;	
+		}
+
+			// make logfile header
+
+		fprintf(logfile, "Time(s)");
+		for (int u = 0; u < pgraph->signalcount; u++)
+		{
+			pDATA = (DATA*)pgraph->signal[u];
+			fprintf_s(logfile, "\t%s", pDATA->signame);
+		}
+		fprintf_s(logfile, "\n");
+	}
+
+	if (pgraph->Logging == LOGGER_XLSX)
+	{
+
+		// create unique filename
+
+		char lpDateStr[MAX_PATH] = "";
+		if (!GetUniqueFilename(lpDateStr, (char*)".xlsx"))
+		{
+			MessageBox(GetFocus(), "Error: impossible to generate an unique filename in the current directory", "Error", MB_ICONERROR);
+			LeaveCriticalSection(&cs);
+			return FALSE;
+		}
+
+		// open Excel and load instance
+		XL = excel_create_instance();
+
+		// Write header
+		char one_line[64] = "Logger header\tAnalog0\tAnalog1\t";
+		//excel_addline(XL, one_line);
+	}
+
+		// Save the start time x=0
 
 	frequency = PerformanceFrequency();
 	start = PerformanceCounter();
 
-	// Create the log file
-	if (pgraph->bLogging == TRUE)
-	{
-		logfile = NULL;
-		char szFilename[MAX_PATH] = "Log.txt";
-		fopen_s(&logfile, szFilename, "w");
-		if (logfile)
-		{
-			fprintf(logfile, "Time(s)\tForce (N)\n");					// make logfile header
-		}
-		else
-		{
-			return FALSE;
-		}
-	}
-
-	// Update status -> Graph ON
+		// Update status -> Graph ON
 
 	pgraph->bRunning = TRUE;
 
 
 	// reset runonce flag
 	runonce = 0;
-
+	LeaveCriticalSection(&cs);
 	return TRUE;
 }
 
@@ -194,12 +277,18 @@ VOID StopGraph(HGRAPH hGraph)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
 
+		// Sanity check
+
 	if (NULL == pgraph)
-		return;
+	{
+		printf("[!] Error at StopGraph() graph handle is null\n");
+		return ;
+	}
 
-	//Close the log file properly
+		//Close the log file properly
 
-	if (pgraph->bLogging == TRUE)
+	EnterCriticalSection(&cs);
+	if (pgraph->Logging == LOGGER_ASCII)
 	{
 		if (logfile)
 		{
@@ -207,12 +296,21 @@ VOID StopGraph(HGRAPH hGraph)
 			logfile = NULL;
 		}
 	}
+	if (pgraph->Logging == LOGGER_XLSX)
+	{
+		if (XL)
+		{
+			excel_drawgraph(XL);
+			excel_save(XL, "test_excel.xlsx");
+			excel_close(XL);
+		}
 
-	// Update status -> Graph OFF
+	}
+
+		// Update status -> Graph OFF
 
 	pgraph->bRunning = FALSE;
-	//pgraph->cur_nbpoints = 0; ACA
-
+	LeaveCriticalSection(&cs);
 }
 
 /*-------------------------------------------------------------------------
@@ -220,14 +318,20 @@ VOID StopGraph(HGRAPH hGraph)
 	Realease the device context and delete the object
   -------------------------------------------------------------------------*/
 
-VOID FreeGraph(HGRAPH hGraph)
+VOID FreeGraph(HGRAPH *hGraph)
 {
-	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (pgraph)
-	{
+		// Sanity check
 
+	if (NULL == hGraph)
+		return;
+
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)*hGraph; // Take the reference not the value
+	
+	EnterCriticalSection(&cs);
+	if (pgraph  !=NULL)
+	{
 		DATA* pDATA;
-		for (int index = 0; index < pgraph->signalcount; index++)
+		for (int index = 0; index < pgraph->totalsignalcount; index++)
 		{
 			pDATA = pgraph->signal[index];
 			if (pDATA)
@@ -245,15 +349,14 @@ VOID FreeGraph(HGRAPH hGraph)
 					free(pDATA->Ynorm);
 
 				free(pDATA);
-			}
-				
+			}			
 		}
 
 		wglMakeCurrent(pgraph->hDC, NULL);
 		wglDeleteContext(pgraph->hRC);
 		ReleaseDC(pgraph->hParentWnd, pgraph->hDC);
 		free(pgraph);
-		pgraph = NULL;
+		
 
 		if (SnapPlot)
 		{
@@ -272,19 +375,18 @@ VOID FreeGraph(HGRAPH hGraph)
 			free(SnapPlot);
 		}
 			
-
 		if (logfile)
 		{
 			fclose(logfile);
 			logfile = NULL;
-		}
-
-		
-		DeleteCriticalSection(&cs);
-
-		hGraph = NULL;
-
+		}	
 	}
+
+	LeaveCriticalSection(&cs);
+	DeleteCriticalSection(&cs);
+
+	*hGraph = NULL;
+
 }
 
 
@@ -297,24 +399,38 @@ VOID FreeGraph(HGRAPH hGraph)
 HGRAPH CreateGraph(HWND hWnd, RECT GraphArea, INT SignalCount, INT BufferSize )
 {
 	int PFDID;
-	GRAPHSTRUCT* pgraph = NULL;
+	static GRAPHSTRUCT* pgraph = NULL;
 
 		// Sanity check
 
+	if (NULL != pgraph) 
+		return pgraph; 
+
 	if (NULL == hWnd)
+	{
+		printf("[!] No control available to load the graph in CreateGraph()\n");
 		return NULL;
+	}
 
 	if (0 == SignalCount || MAX_SIGNAL_COUNT < SignalCount || 0 >= BufferSize)
+	{
+		printf("[!] SignalCount not in range in CreateGraph()\n");
 		return NULL;
+	}
 
 		// Initialyze sync
 
 	InitializeCriticalSection(&cs);
+	EnterCriticalSection(&cs);
 
 		// Init struct
 
 	if (NULL == (pgraph = (GRAPHSTRUCT*)malloc(sizeof(GRAPHSTRUCT) + sizeof(void*) * SignalCount)))		// Carefully taking in account signal declaration DATA*signal[], so allocate space for each new ptr on the fly
+	{
+		LeaveCriticalSection(&cs);
+		printf("[!] malloc() failed in CreateGraph()\n");
 		return NULL;	// Otherwize Heap will be corrupted
+	}
 
 		// Struct memory zero at startup
 
@@ -325,69 +441,127 @@ HGRAPH CreateGraph(HWND hWnd, RECT GraphArea, INT SignalCount, INT BufferSize )
 	for (int i = 0; i < SignalCount; i++)
 	{
 		if (NULL == (pgraph->signal[i] = (DATA*)malloc(sizeof(DATA))))
+		{
+			LeaveCriticalSection(&cs);
+			printf("[!] malloc failed to build signals buffer in CreateGraph()\n");
 			return NULL;
+		}
+
 		DATA* pDATA = pgraph->signal[i];
 
-		if (NULL == (pDATA->X = (float*)malloc(sizeof(float) * BufferSize)))
-			return NULL;		
-
-		if (NULL == (pDATA->Y = (float*)malloc(sizeof(float) * BufferSize)))
-			return NULL;	
-
-		if (NULL == (pDATA->Xnorm = (float*)malloc(sizeof(float) * BufferSize)))
+		if (NULL == (pDATA->X = (double*)malloc(sizeof(double) * BufferSize)))
+		{
+			LeaveCriticalSection(&cs);
+			printf("[!] malloc failed to build signals buffer in CreateGraph()\n");
 			return NULL;
+		}
 
-		if (NULL == (pDATA->Ynorm = (float*)malloc(sizeof(float) * BufferSize)))
+		if (NULL == (pDATA->Y = (double*)malloc(sizeof(double) * BufferSize)))
+		{
+			LeaveCriticalSection(&cs);
+			printf("[!] malloc failed to build signals buffer in CreateGraph()\n");
 			return NULL;
+		}
 
-		memset(pDATA->X, 0, sizeof(float) * BufferSize);
-		memset(pDATA->Y, 0, sizeof(float) * BufferSize);
-		memset(pDATA->Xnorm, 0, sizeof(float) * BufferSize);
-		memset(pDATA->Ynorm, 0, sizeof(float) * BufferSize);
+		if (NULL == (pDATA->Xnorm = (double*)malloc(sizeof(double) * BufferSize)))
+		{
+			LeaveCriticalSection(&cs);
+			printf("[!] malloc failed to build signals buffer in CreateGraph()\n");
+			return NULL;
+		}
+
+		if (NULL == (pDATA->Ynorm = (double*)malloc(sizeof(double) * BufferSize)))
+		{
+			LeaveCriticalSection(&cs);
+			printf("[!] malloc failed to build signals buffer in CreateGraph()\n");
+			return NULL;
+		}
+
+		memset(pDATA->X, 0, sizeof(double) * BufferSize);
+		memset(pDATA->Y, 0, sizeof(double) * BufferSize);
+		memset(pDATA->Xnorm, 0, sizeof(double) * BufferSize);
+		memset(pDATA->Ynorm, 0, sizeof(double) * BufferSize);
 
 		pDATA->Xmax = 0.0;
 		pDATA->Xmin = 0.0;
 		pDATA->Ymax = 0.0;
 		pDATA->Ymin = 0.0;
 
+		pDATA->stat.min_value = 0.0;
+		pDATA->stat.average_value_accumulator = 0.0;
+		pDATA->stat.average_value_counter = 0;
+		pDATA->stat.average_value = 0.0;
+		pDATA->stat.max_value = 0.0;
+
+			// set default signal name
+
+		snprintf(pDATA->signame, sizeof(pDATA->signame) - 1, "Analog%i", i);
+
+			// set default signal color
+
+		pDATA->color[0] = 0.5f; pDATA->color[1] = 0.5f; pDATA->color[2] = 0.01f*i;
+
 			// Update the number of signal inside object HGRAPH
 
 		pgraph->signalcount++;
 	}
 
+	pgraph->totalsignalcount = pgraph->signalcount;
 	pgraph->BufferSize = BufferSize;
 
 		// Allocate a temp struct for computing
 
 	SnapPlot = NULL;
 	if(NULL== (SnapPlot = (DATA*)malloc(sizeof(DATA))))
+	{
+		LeaveCriticalSection(&cs);
+		printf("[!] malloc failed to build temp signals buffer in CreateGraph()\n");
 		return NULL;
+	}
 
-	if (NULL == (SnapPlot->X = (float*)malloc(sizeof(float) * BufferSize)))
+	if (NULL == (SnapPlot->X = (double*)malloc(sizeof(double) * BufferSize)))
+	{
+		LeaveCriticalSection(&cs);
+		printf("[!] malloc failed to build temp signals buffer in CreateGraph()\n");
 		return NULL;
+	}
 
-	if (NULL == (SnapPlot->Y = (float*)malloc(sizeof(float) * BufferSize)))
+	if (NULL == (SnapPlot->Y = (double*)malloc(sizeof(double) * BufferSize)))
+	{
+		LeaveCriticalSection(&cs);
+		printf("[!] malloc failed to build temp signals buffer in CreateGraph()\n");
 		return NULL;
+	}
 
-	if (NULL == (SnapPlot->Xnorm = (float*)malloc(sizeof(float) * BufferSize)))
+	if (NULL == (SnapPlot->Xnorm = (double*)malloc(sizeof(double) * BufferSize)))
+	{
+		LeaveCriticalSection(&cs);
+		printf("[!] malloc failed to build temp signals buffer in CreateGraph()\n");
 		return NULL;
+	}
 
-	if (NULL == (SnapPlot->Ynorm = (float*)malloc(sizeof(float) * BufferSize)))
+	if (NULL == (SnapPlot->Ynorm = (double*)malloc(sizeof(double) * BufferSize)))
+	{
+		LeaveCriticalSection(&cs);
+		printf("[!] malloc failed to build temp signals buffer in CreateGraph()\n");
 		return NULL;
+	}
 
-	memset(SnapPlot->X, 0, sizeof(float) * BufferSize);
-	memset(SnapPlot->Y, 0, sizeof(float) * BufferSize);
-	memset(SnapPlot->Xnorm, 0, sizeof(float) * BufferSize);
-	memset(SnapPlot->Ynorm, 0, sizeof(float) * BufferSize);
+	memset(SnapPlot->X, 0, sizeof(double) * BufferSize);
+	memset(SnapPlot->Y, 0, sizeof(double) * BufferSize);
+	memset(SnapPlot->Xnorm, 0, sizeof(double) * BufferSize);
+	memset(SnapPlot->Ynorm, 0, sizeof(double) * BufferSize);
 
 	pgraph->hParentWnd = hWnd;
 
-	// Graph created in a "Static" control windows class named "Graph"
+	// Graph created in a "Static" control windows class named ""
 	// When redrawn the control will be painted with the graph in place of
+
+	//printf("[*] CreateGraph() of position l:%i t:%i r:%i b:%i \n", GraphArea.left, GraphArea.top, GraphArea.right, GraphArea.bottom );
 
 	pgraph->hGraphWnd = CreateWindow(
 		"Static",													// Predefined class; Unicode assumed 
-		"Graph",													// The text will be erased by OpenGL
+		"",															// The text will be erased by OpenGL
 		WS_EX_TRANSPARENT | WS_VISIBLE | WS_CHILD,					// Styles WS_EX_TRANSPARENT mandatory
 		GraphArea.left,												// x pos
 		GraphArea.top,												// y pos
@@ -401,16 +575,25 @@ HGRAPH CreateGraph(HWND hWnd, RECT GraphArea, INT SignalCount, INT BufferSize )
 		// Sanity check
 
 	if (NULL == pgraph->hGraphWnd)
+	{
+		printf("[!] CreateWindow() failed in CreateGraph()\n");
+		LeaveCriticalSection(&cs);
 		return NULL;
+	}
 
 	pgraph->hDC = GetDC(pgraph->hGraphWnd);
 
-	// Sanity check
+		// Sanity check
 
 	if (NULL == pgraph->hDC)
+	{
+		printf("[!] GetDC() failed in CreateGraph()\n");
+		LeaveCriticalSection(&cs);
 		return NULL;
+	}
+		
 
-	// Load OpenGL specific to legacy version
+		// Load OpenGL specific to legacy version
 
 	ZeroMemory(&pfd, sizeof(pfd));
 	pfd.nSize = sizeof(pfd);
@@ -421,75 +604,217 @@ HGRAPH CreateGraph(HWND hWnd, RECT GraphArea, INT SignalCount, INT BufferSize )
 	pfd.cAlphaBits = 8;
 	pfd.cDepthBits = 24;
 
-	// To support advanced pixel format it is needed to load modern OpenGL functions
-	// Only the legacy version is supported here
+		// To support advanced pixel format it is needed to load modern OpenGL functions
+		// Only the legacy version is supported here
 
 	PFDID = ChoosePixelFormat(pgraph->hDC, &pfd);
 	if (PFDID == 0)
 	{
-		MessageBox(0, "Can't Find A Suitable PixelFormat.", "Error", MB_OK | MB_ICONERROR);
+		LeaveCriticalSection(&cs);
+		MessageBox(0, "[!] Can't Find A Suitable PixelFormat.", "Error", MB_OK | MB_ICONERROR);
 		PostQuitMessage(0);
 		return NULL;
 	}
 
 	if (SetPixelFormat(pgraph->hDC, PFDID, &pfd) == false)
 	{
-		MessageBox(0, "Can't Set The PixelFormat.", "Error", MB_OK | MB_ICONERROR);
+		LeaveCriticalSection(&cs);
+		MessageBox(0, "[!] Can't Set The PixelFormat.", "Error", MB_OK | MB_ICONERROR);
 		PostQuitMessage(0);
 		return NULL;
 	}
 
-	// Rendering Context
+		// Rendering Context
 
 	pgraph->hRC = wglCreateContext(pgraph->hDC);
 
 	if (pgraph->hRC == 0)
 	{
-		MessageBox(0, "Can't Create A GL Rendering Context.", "Error", MB_OK | MB_ICONERROR);
+		LeaveCriticalSection(&cs);
+		MessageBox(0, "[!] Can't Create A GL Rendering Context.", "Error", MB_OK | MB_ICONERROR);
 		PostQuitMessage(0);
 		return NULL;
 	}
 
 	if (wglMakeCurrent(pgraph->hDC, pgraph->hRC) == false)
 	{
-		MessageBox(0, "Can't activate GLRC.", "Error", MB_OK | MB_ICONERROR);
+		LeaveCriticalSection(&cs);
+		MessageBox(0, "[!] Can't activate GLRC.", "Error", MB_OK | MB_ICONERROR);
 		PostQuitMessage(0);
 		return NULL;
 	}
+	pgraph->scale_factor = 1;
 	pgraph->bAutoscale = true;
-	pgraph->bLogging = false;
+	pgraph->bDisplayCursor = true;
+	pgraph->Logging = LOGGER_NONE;
+	pgraph->Filtering = FILTER_NONE;
 	GetClientRect(pgraph->hGraphWnd, &DispArea);
 	InitGL(pgraph, DispArea.right, DispArea.bottom);
+	ReshapeGraph(pgraph, DispArea.left, DispArea.top, DispArea.right, DispArea.bottom );
+	LeaveCriticalSection(&cs);
 	return pgraph;
 }
 
 /*-------------------------------------------------------------------------
-	SetSignalLabel: set a name to a signal
-  -------------------------------------------------------------------------*/
+	SetSignalCount: set a new total signal count ; 
+	must be in range between [0;MAX_SIGNAL_COUNT]
+-------------------------------------------------------------------------*/
 
-VOID SetSignalLabel(HGRAPH hGraph, CONST CHAR *lpszLabel, INT iSignalNumber)
+BOOL SetSignalCount(HGRAPH hGraph,CONST INT iSignalNumber)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph)
-		return;
 
-	iSignalNumber--; // Signal number [0-15]
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetSignalCount() graph handle is null\n");
+		return FALSE;
+	}
+
+	if (iSignalNumber > MAX_SIGNAL_COUNT)
+	{
+		printf("[!] Error at SetSignalCount()\n%i signal max is reached\n", pgraph->signalcount);
+	    return FALSE;
+	}
+
+	pgraph->signalcount = iSignalNumber;
+	return TRUE;
+}
+
+/*-------------------------------------------------------------------------
+	SetSignalLabel: set a name to a signal [0;MAXSIG-1]
+-------------------------------------------------------------------------*/
+
+VOID SetSignalLabel(HGRAPH hGraph, CONST CHAR szLabel[260], INT iSignalNumber) 
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetSignalLabel()\ngraph handle is null\n");
+		return;
+	}
+
+	if (iSignalNumber < 0 || iSignalNumber >= pgraph->signalcount)
+	{
+		printf("[!] Error at SetSignalLabel()\nrange must be [1;%i] and is %i\n", pgraph->signalcount, iSignalNumber);
+		return;
+	}
+
+	printf("[*] a new signal name is assigned: %s\n", szLabel);
+	DATA* signal = (DATA*)pgraph->signal[iSignalNumber];
+	strncpy_s(signal->signame, szLabel, sizeof(signal->signame)-1);
+}
+
+/*-------------------------------------------------------------------------
+	SetSignalColor: Specify a RGB color [0-255] 
+-------------------------------------------------------------------------*/
+
+VOID SetSignalColor(HGRAPH hGraph, INT R, INT G, INT B, INT iSignalNumber)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetSignalColor() graph handle is null\n");
+		return;
+	}
+
+	if(iSignalNumber> MAX_SIGNAL_COUNT-1)
+	{
+		printf("[!] Error at SetSignalColor() MAX_SIGNAL_COUNT reached \n");
+		return;
+	}
+
+	if (R < 0 || R> 255)
+	{
+		printf("[!] Error at SetSignalColor() R value overflow R:%i\n", R);
+		return;
+	}
+
+	if (G < 0 || G> 255)
+	{
+		printf("[!] Error at SetSignalColor() G value overflow G:%i\n", G);
+		return;
+	}
+
+	if (B < 0 || B> 255)
+	{
+		printf("[!] Error at SetSignalColor() B value overflow B:%i\n", B);
+		return;
+	}
+
+	printf("[*] a new signal color is assigned: RGBf (%i %i %i) at position: %i\n", R,G,B, iSignalNumber);
+	DATA* signal = (DATA*)pgraph->signal[iSignalNumber];
+	if (NULL == signal)
+	{
+		printf("[!] Error at SetSignalColor() graph signal %i is null\n", iSignalNumber);
+		return;
+		
+	}
+	signal->color[0] = (float)R / 255.0f;
+	signal->color[1] = (float)G / 255.0f;
+	signal->color[2] = (float)B / 255.0f;
+
+
+	//////////////////////////////////////////////////
+
+	for (int i = 0; i < pgraph->signalcount; i++)
+	{
+		signal = (DATA*)pgraph->signal[i];
+		printf("[WINGRAPH]%i %s (%i %i %i)\n",i, signal->signame, (int)(signal->color[0]*255.0f), (int)(signal->color[1] * 255.0f), (int)(signal->color[2] * 255.0f));	
+	}
+}
+
+/*-------------------------------------------------------------------------
+	SetSignalVisible: Enable or disable specific signal on graph
+-------------------------------------------------------------------------*/
+
+VOID SetSignalVisible(HGRAPH hGraph, BOOL bDisplay, INT iSignalNumber)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetSignalVisible()\ngraph handle is null\n");
+		return;
+	}
+
+	if (iSignalNumber < 0 || iSignalNumber >= pgraph->signalcount)
+	{
+		printf("[!] Error at SetSignalVisible()\nrange must be [1;%i] and is %i\n", pgraph->signalcount, iSignalNumber);
+		return;
+	}
 
 	DATA* signal = (DATA*)pgraph->signal[iSignalNumber];
-	strncpy_s(signal->signame, lpszLabel, 64);
+	signal->show = bDisplay;
+
+	printf("[*] Signal visibility changed at signal number: %i\n", iSignalNumber);
 }
 
 /*-------------------------------------------------------------------------
 	SetRecordingMode: set the graph reccording state with bLogging
   -------------------------------------------------------------------------*/
 
-VOID SetRecordingMode(HGRAPH hGraph, BOOL logging)
+VOID SetRecordingMode(HGRAPH hGraph, LOGGER_M logging)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph)
-		return;
 
-	pgraph->bLogging = logging;
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetRecordingMode() graph handle is null\n");
+		return;
+	}
+	pgraph->Logging = logging;
 }
 
 /*-------------------------------------------------------------------------
@@ -499,8 +824,14 @@ VOID SetRecordingMode(HGRAPH hGraph, BOOL logging)
 VOID SetAutoscaleMode(HGRAPH hGraph, BOOL mode)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
 	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetAutoscaleMode() graph handle is null\n");
 		return;
+	}
 
 	pgraph->bAutoscale = mode;
 
@@ -522,14 +853,39 @@ VOID SetAutoscaleMode(HGRAPH hGraph, BOOL mode)
 }
 
 /*-------------------------------------------------------------------------
+	SetDisplayCursor: Add indicator bellow the mouse cursor with X and Y values
+  -------------------------------------------------------------------------*/
+
+VOID SetDisplayCursor(HGRAPH hGraph, BOOL isActive)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetDisplayCursor() graph handle is null\n");
+		return;
+	}
+
+	pgraph->bDisplayCursor = isActive;
+}
+
+/*-------------------------------------------------------------------------
 	SetYminVal: set the Ymin scale value
   -------------------------------------------------------------------------*/
 
-VOID SetYminVal(HGRAPH hGraph, FLOAT ymin)
+VOID SetYminVal(HGRAPH hGraph, double ymin)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
 	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetYminVal() graph handle is null\n");
 		return;
+	}
 
 	pgraph->ymin_fix = ymin;
 }
@@ -538,26 +894,172 @@ VOID SetYminVal(HGRAPH hGraph, FLOAT ymin)
 	SetYmaxVal: set the Ymin scale value
   -------------------------------------------------------------------------*/
 
-VOID SetYmaxVal(HGRAPH hGraph, FLOAT ymax)
+VOID SetYmaxVal(HGRAPH hGraph, double ymax)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
 	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetYmaxVal() graph handle is null\n");
 		return;
+	}
 
 	pgraph->ymax_fix = ymax;
+}
+
+VOID SetZoomFactor(HGRAPH hGraph, int zoom)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetZoomFactor() graph handle is null\n");
+		return;
+	}
+
+	if (zoom < 0)
+	{
+		printf("[!] Error at SetZoomFactor() zoom can't be <0\n");
+		return;
+	}
+
+	pgraph->scale_factor = zoom;
+	return;
 }
 
 /*-------------------------------------------------------------------------
 	SetFilteringMode: set the EMA filtering state
   -------------------------------------------------------------------------*/
 
-VOID SetFilteringMode(HGRAPH hGraph, BOOL filtering)
-{
+VOID SetFilteringMode(HGRAPH hGraph, FILTER_M filtering)
+{		
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph)
-		return;
 
-	pgraph->bFiltering = filtering;
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetFilteringMode() graph handle is null\n");
+		return;
+	}
+
+	pgraph->Filtering = filtering;
+}
+
+VOID SetSignalMinValue(HGRAPH hGraph, INT SIGNB, DOUBLE val)
+{
+	if (SIGNB > MAX_SIGNAL_COUNT || SIGNB < 0)
+	{
+		printf("[!] Error at SignalResetStatisticValue() signal number not in range\n");
+		return;
+	}
+
+	EnterCriticalSection(&cs);
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph handle is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph signal count is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints >= 0)
+	{
+		pData->stat.min_value = val;
+		pData->stat.average_value_accumulator = 0.0;
+		pData->stat.average_value_counter = 0;
+	}
+	LeaveCriticalSection(&cs);
+}
+
+VOID SetSignalAverageValue(HGRAPH hGraph, INT SIGNB, DOUBLE val)
+{
+	if (SIGNB > MAX_SIGNAL_COUNT || SIGNB < 0)
+	{
+		printf("[!] Error at SignalResetStatisticValue() signal number not in range\n");
+		return;
+	}
+
+	EnterCriticalSection(&cs);
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph handle is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph signal count is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints >= 0)
+	{
+		pData->stat.average_value = val;
+		pData->stat.average_value_accumulator = 0.0;
+		pData->stat.average_value_counter = 0;
+
+	}
+	LeaveCriticalSection(&cs);
+}
+
+VOID SetSignalMaxValue(HGRAPH hGraph, INT SIGNB, DOUBLE val)
+{
+	if (SIGNB > MAX_SIGNAL_COUNT || SIGNB < 0)
+	{
+		printf("[!] Error at SignalResetStatisticValue() signal number not in range\n");
+		return;
+	}
+
+	EnterCriticalSection(&cs);
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph handle is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph signal count is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints >= 0)
+	{
+		pData->stat.average_value_accumulator = 0.0;
+		pData->stat.average_value_counter = 0;
+		pData->stat.max_value = val;
+	}
+	LeaveCriticalSection(&cs);
 }
 
 /*-------------------------------------------------------------------------
@@ -566,13 +1068,17 @@ VOID SetFilteringMode(HGRAPH hGraph, BOOL filtering)
 
 BOOL GetGraphState(HGRAPH hGraph)
 {
-	PGRAPHSTRUCT pgraph = NULL;
-	pgraph = (PGRAPHSTRUCT)hGraph;
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
 	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetGraphState() graph handle is null\n");
 		return FALSE;
+	}
 
 	return pgraph->bRunning;
-
 }
 
 /*-------------------------------------------------------------------------
@@ -581,15 +1087,21 @@ BOOL GetGraphState(HGRAPH hGraph)
 
 HGLRC GetGraphRC(HGRAPH hGraph)
 {
-	// Sanity check
-
-	if (NULL == hGraph)
-		return NULL;
-
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph->hRC)
-		return NULL;
 
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetGraphRC() graph handle is null\n");
+		return NULL;
+	}
+
+	if (NULL == pgraph->hRC)
+	{
+		printf("[!] Error at GetGraphRC() graph RC is null\n");
+		return NULL;
+	}
 	return pgraph->hRC;
 }
 
@@ -599,14 +1111,21 @@ HGLRC GetGraphRC(HGRAPH hGraph)
 
 HDC GetGraphDC(HGRAPH hGraph)
 {
-	// Sanity check
-
-	if (NULL == hGraph)
-		return NULL;
-
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph->hDC)
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetGraphDC() graph handle is null\n");
 		return NULL;
+	}
+
+	if (NULL == pgraph->hDC)
+	{
+		printf("[!] Error at GetGraphDC() graph DC is null\n");
+		return NULL;
+	}
 
 	return pgraph->hDC;
 }
@@ -617,14 +1136,21 @@ HDC GetGraphDC(HGRAPH hGraph)
 
 HWND GetGraphParentWnd(HGRAPH hGraph)
 {
-	// Sanity check
-
-	if (NULL == hGraph)
-		return NULL;
-
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph->hParentWnd)
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetGraphParentWnd() graph handle is null\n");
 		return NULL;
+	}
+
+	if (NULL == pgraph->hParentWnd)
+	{
+		printf("[!] Error at GetGraphDC() graph parent windows is null\n");
+		return NULL;
+	}
 
 	return pgraph->hParentWnd;
 }
@@ -634,15 +1160,22 @@ HWND GetGraphParentWnd(HGRAPH hGraph)
   -------------------------------------------------------------------------*/
 
 HWND GetGraphWnd(HGRAPH hGraph)
-{
-	// Sanity check
-
-	if (NULL == hGraph)
-		return NULL;
-
+{	
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph->hGraphWnd)
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetGraphWnd() graph handle is null\n");
 		return NULL;
+	}
+
+	if (NULL == pgraph->hGraphWnd)
+	{
+		printf("[!] Error at GetGraphWnd() graph Windows is null\n");
+		return NULL;
+	}
 
 	return pgraph->hGraphWnd;
 }
@@ -652,34 +1185,66 @@ HWND GetGraphWnd(HGRAPH hGraph)
   -------------------------------------------------------------------------*/
 
 INT GetGraphSignalCount(HGRAPH hGraph)
-{
-	// Sanity check
-
-	if (NULL == hGraph)
-		return NULL;
-
+{		
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetGraphSignalCount() graph handle is null\n");
+		return -1;
+	}
+
 	if (NULL == pgraph->signalcount)
-		return NULL;
+	{
+		printf("[!] Error at GetGraphSignalCount() graph signal count is null\n");
+		return -1;
+	}
 
 	return pgraph->signalcount;
+}
+
+INT GetZoomFactor(HGRAPH hGraph)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SetZoomFactor() graph handle is null\n");
+		return 0;
+	}
+
+	return pgraph->scale_factor;
 }
 
 /*-------------------------------------------------------------------------
 	GetGraphSignalNumber: return the total signals number
   -------------------------------------------------------------------------*/
 
-FLOAT GetGraphLastSignalValue(HGRAPH hGraph, INT SIGNB)
+double GetGraphLastSignalValue(HGRAPH hGraph, INT SIGNB)
 {
-	// Sanity check
-
-	if (NULL == hGraph)
-		return NULL;
-
-	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph->signalcount)
-		return NULL;
 	EnterCriticalSection(&cs);
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetGraphLastSignalValue() graph handle is null\n");
+		LeaveCriticalSection(&cs);
+		return 0.0f;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at GetGraphLastSignalValue() graph signal count is null\n");
+		LeaveCriticalSection(&cs);
+		return 0.0f;
+	}
+
 	DATA* pData = NULL;
 	pData = (DATA*)pgraph->signal[SIGNB];
 	if (pgraph->cur_nbpoints > 0)
@@ -690,35 +1255,186 @@ FLOAT GetGraphLastSignalValue(HGRAPH hGraph, INT SIGNB)
 	else
 	{
 		LeaveCriticalSection(&cs);
-	}
 		return 0.0f;
+	}		
+}
+
+double GetSignalMinValue(HGRAPH hGraph, INT SIGNB)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetSignalMinValue() graph handle is null\n");
+		return 0.0f;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at GetSignalMinValue() graph signal count is null\n");
+		return 0.0f;
+	}
+
+	if (SIGNB > MAX_SIGNAL_COUNT || SIGNB < 0)
+	{
+		printf("[!] Error at SignalResetStatisticValue() signal number not in range\n");
+		return 0.0;
+	}
+
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints > 0)
+	{
+		return pData->stat.min_value;
+	}
+	return 0.0;
+}
+
+double GetSignalAverageValue(HGRAPH hGraph, INT SIGNB)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetSignalAverageValue() graph handle is null\n");
+		return 0.0f;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at GetSignalAverageValue() graph signal count is null\n");
+		return 0.0f;
+	}
+
+	if (SIGNB > MAX_SIGNAL_COUNT || SIGNB < 0)
+	{
+		printf("[!] Error at SignalResetStatisticValue() signal number not in range\n");
+		return 0.0;
+	}
+
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints > 0)
+	{
+		return pData->stat.average_value;
+	}
+	return 0.0;
+}
+
+double GetSignalMaxValue(HGRAPH hGraph, INT SIGNB)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetSignalMaxValue() graph handle is null\n");
+		return 0.0f;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at GetSignalMaxValue() graph signal count is null\n");
+		return 0.0f;
+	}
+
+	if (SIGNB > MAX_SIGNAL_COUNT || SIGNB < 0)
+	{
+		printf("[!] Error at SignalResetStatisticValue() signal number not in range\n");
+		return 0.0;
+	}
+
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints > 0)
+	{
+		return pData->stat.max_value;
+	}
+	return 0.0;
+}
+
+VOID SignalResetStatisticValue(HGRAPH hGraph, INT SIGNB)
+{
+	if (SIGNB > MAX_SIGNAL_COUNT || SIGNB < 0)
+	{
+		printf("[!] Error at SignalResetStatisticValue() signal number not in range\n");
+		return;
+	}
+
+	EnterCriticalSection(&cs);
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph handle is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	if (NULL == pgraph->signalcount)
+	{
+		printf("[!] Error at SignalResetStatisticValue() graph signal count is null\n");
+		LeaveCriticalSection(&cs);
+		return;
+	}
+
+	DATA* pData = NULL;
+	pData = (DATA*)pgraph->signal[SIGNB];
+	if (pgraph->cur_nbpoints > 0)
+	{	
+		pData->stat.min_value = pData->Y[pgraph->cur_nbpoints - 1];
+		pData->stat.average_value = pData->Y[pgraph->cur_nbpoints - 1];
+		pData->stat.average_value_accumulator = 0.0;
+		pData->stat.average_value_counter = 0;
+		pData->stat.max_value = pData->Y[pgraph->cur_nbpoints - 1];
+		printf("[*] SignalResetStatisticValue() min: %lf	avg: %lf	max: %lf\n", pData->stat.min_value, pData->stat.average_value, pData->stat.max_value);
+	}
+	LeaveCriticalSection(&cs);
 }
 
 
-VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
+VOID AddPoints(HGRAPH hGraph, double* y, INT PointsCount)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at AddPoints() graph handle is null\n");
+		return;
+	}
+
 	DATA* pDATA = NULL;
 	if (cs.DebugInfo == NULL)
 	{
+		printf("[!] Error at AddPoints() critical section not available\n");
 		return;
 	}
 
 	EnterCriticalSection(&cs);
 
-	// Sanity check
+		// Sanity check
 
-	if (NULL == pgraph || FALSE == pgraph->bRunning)
+	if (FALSE == pgraph->bRunning)
 	{
 		LeaveCriticalSection(&cs);
+		printf("[!] Error at AddPoints() graph not strated\n");
 		return;
 	}
 
-	// TODO: Check if signalcount = length of y!
+		// TODO: Check if signalcount = length of y!
 
 	if (pgraph->signalcount != PointsCount)
 	{
 		LeaveCriticalSection(&cs);
+		printf("[!] Error at AddPoints() signalcount not egual to y length\n");
 		return;
 	}
 
@@ -740,7 +1456,7 @@ VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
 		pgraph->cur_nbpoints--;																				// Update the current point number
 	}
 
-	// Save the actual timestamp
+		// Save the actual timestamp
 
 	if (pgraph->cur_nbpoints == 0)
 	{
@@ -750,47 +1466,140 @@ VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
 	{
 		finish = PerformanceCounter();
 	}
-
-	if (logfile)
+	if (pgraph->Logging == LOGGER_ASCII)
 	{
-		fprintf(logfile, "%lf\t", (float)((finish - start)) / frequency);
+		if (logfile)
+		{
+			fprintf(logfile, "%lf\t", (double)((finish - start)) / frequency);
+		}
 	}
+	if (pgraph->Logging == LOGGER_XLSX)
+	{
+		if (XL)
+		{
+			char buffer[260] = "";
+			sprintf_s(buffer, "%lf\t", (double)((finish - start)) / frequency);
+			excel_addline(&XL, buffer);
+		}
+	}
+
+	char lpszDataValues[260] = ""; // char values accumulator for XLSX; be carefull max 260 char -> BOF
+
 	for (int index = 0; index < pgraph->signalcount; index++)
 	{
 		pDATA = pgraph->signal[index];
 		if (NULL == pDATA)
 		{
 			LeaveCriticalSection(&cs);
+			printf("[!] Error at AddPoints() data buffer is null\n");
 			return;
 		}
 
-			// Low pass filter
+			// Low pass filter 
 
-		if (pgraph->bFiltering == true)
+		if (pgraph->Filtering == FILTER_EMA)
 		{
-			float a = 0.1; // Custom cut freq 
-
+			double a = 0.1; // Custom cut freq 
 			if (pgraph->cur_nbpoints == 0)
 				y[index] = y[index]; // First point skip to prevent INF
 			else
-				y[index] = a * y[index] + (1 - a) * pDATA->Y[pgraph->cur_nbpoints - 1]; // Low pass filter EMA "f(x) = x1 * a + (1-a) * x0" where a [0;1]
+				y[index] = a * y[index] + (1 - a) * pDATA->Y[pgraph->cur_nbpoints - 1];						// Low pass filter EMA "f(x) = x1 * a + (1-a) * x0" where a [0;1]
+		}
+
+			// Hanning window filter
+
+		if (pgraph->Filtering == FILTER_HANNING) // experimental (not properly working)
+		{
+			const int window_size = 20;																		// Define the Hann windows size here
+			static double dataOut[window_size];
+			static int accumulator = 0;
+			if (accumulator < window_size)
+			{
+				printf("[*] Hanning filter collecting...\n");
+				LeaveCriticalSection(&cs);
+				accumulator++;
+				return;
+			}
+			accumulator = 0;
+
+			for (int i = 0; i < window_size; i++)
+			{			
+				
+				const double PI = 3.14159;
+				double multiplier = 0.5 * (1 - cos(2 * PI * i / window_size));
+				dataOut[i] = multiplier * y[index];
+			}
+		}
+
+			// Besel filter
+
+		if (pgraph->Filtering == FILTER_BESEL)
+		{
 		}
 			
 			// Add points to the selected buffer	
 
-		pDATA->X[pgraph->cur_nbpoints] = (float)((finish - start)) / frequency;								// Save in X the elapsed time from start
+		pDATA->X[pgraph->cur_nbpoints] = (double)((finish - start)) / frequency;							// Save in X the elapsed time from start
 		pDATA->Y[pgraph->cur_nbpoints] = y[index];															// Save Y
-		if (logfile)
+
+			// Perform some statistics
+
+		// period
+		pDATA->stat.period_s = pDATA->X[pgraph->cur_nbpoints] - pDATA->X[0];								// Update current period
+		
+		//min
+		if (pDATA->Y[pgraph->cur_nbpoints] < pDATA->stat.min_value)
 		{
-			fprintf(logfile, "%lf\t", y[index]);
+			pDATA->stat.min_value = pDATA->Y[pgraph->cur_nbpoints];											// Update current min value displayed
+		}
+
+		//average
+		if (pgraph->cur_nbpoints > 0)
+		{
+			pDATA->stat.average_value_accumulator += pDATA->Y[pgraph->cur_nbpoints];
+			pDATA->stat.average_value_counter++;
+
+			pDATA->stat.average_value = pDATA->stat.average_value_accumulator / pDATA->stat.average_value_counter;
+		}
+
+		//max
+		if (pDATA->Y[pgraph->cur_nbpoints] > pDATA->stat.max_value)
+		{
+			pDATA->stat.max_value = pDATA->Y[pgraph->cur_nbpoints];											// Update current max value displayed
+		}
+		if (pgraph->Logging == LOGGER_ASCII)
+		{
+			if (logfile)
+			{
+				fprintf_s(logfile, "%lf\t", y[index]);
+			}
+		}
+		if (pgraph->Logging == LOGGER_XLSX)
+		{
+			if (XL)
+			{
+				sprintf_s(lpszDataValues, "%lf\t", y[index]);
+			}
 		}
 	}
-	if (logfile)
+	if (pgraph->Logging == LOGGER_ASCII)
 	{
-		fprintf(logfile, "\n");
+		if (logfile)
+		{
+			fprintf(logfile, "\n");
+		}
+	}
+	if (pgraph->Logging == LOGGER_XLSX)
+	{
+		if (XL)
+		{
+			HRESULT hres = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+			excel_addline(XL, lpszDataValues);
+		}
 	}
 
-	// Inc the number of points
+
+		// Inc the number of points
 
 	pgraph->cur_nbpoints++;
 
@@ -801,211 +1610,214 @@ VOID AddPoints(HGRAPH hGraph, float* y, INT PointsCount)
 	Render: Analyze the data buffers and print waves to the
 	OpenGL device context
   -------------------------------------------------------------------------*/
-
 BOOL Render(HGRAPH hGraph)
 {
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
 	// Sanity check
 
-	if (NULL == hGraph)
-		return FALSE;
-
-	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	if (NULL == pgraph->hGraphWnd)
-		return FALSE;
-
-	if (pgraph->cur_nbpoints > 0)
+	if (NULL == pgraph)
 	{
-		EnterCriticalSection(&cs);
-
-		//long long t1 = PerformanceCounter(); //DBG
-
-		UpdateBorder(hGraph);																			// border determination for each signal: meaning finding X and Y min max values																		
-		//DATA** sig = pgraph->signal; //DBG
-
-		//long long t2 = PerformanceCounter(); //DBG
-		//double freq = (double)((t2 - t1)) / frequency * 1000; //DBG
-		//printf("\rupdate_border take: %lf ms\r", freq); //DBG
-
-		//memset(SnapPlot, 0, sizeof(DATA));															// Reset computing datas
-		ZeroObject(hGraph, SnapPlot);
-		FindGlobalMaxScale(hGraph, SnapPlot->Xmin, SnapPlot->Xmax, SnapPlot->Ymin, SnapPlot->Ymax);		// Finding the Y min and max of all the signals to scale on ite
-		normalize_data(hGraph, SnapPlot->Xmin, SnapPlot->Xmax, SnapPlot->Ymin, SnapPlot->Ymax);			// normalize between [0;1]
-		GetClientRect(pgraph->hGraphWnd, &DispArea);
-
-		// Use the Projection Matrix
-
-		glMatrixMode(GL_PROJECTION);
-
-		// Reset Matrix
-
-		glLoadIdentity();
-
-		// Set the correct perspective.
-
-		gluOrtho2D(-0.08, 1.04, 0 - 0.08, 1 + 0.02);
-		glViewport(0, 0, DispArea.right, DispArea.bottom);
-
-		// Use the Model Matrix
-
-		glMatrixMode(GL_MODELVIEW);
-
-		// Reset Matrix
-
-		glLoadIdentity();
-
-		// Clear Color and Depth Buffers
-
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-		// to run once
-
-		glClear(GL_COLOR_BUFFER_BIT);
-
-		DrawGraphSquare();
-		DrawGridLines();
-
-		if (SnapPlot->Ymax != SnapPlot->Ymin)
-		{
-			float txtlen = 0.0;
-			float txtheight = 0.0;
-			char value[64];
-			char Xname[] = "Time (s)";
-			float reelval = SnapPlot->Ymin;
-			int div = 5;
-
-			// draw points
-
-			DrawWave(hGraph);
-
-			// draw indicators
-
-			glColor3f(0.1f, 0.1f, 0.1f);
-
-			// zero
-
-			float zero = GetStandardizedData(0, SnapPlot->Ymin, SnapPlot->Ymax);
-			if (zero > 0 && zero < 1)
-			{
-				DrawString(-0.02f, zero - 0.01f, (char*)"0");
-				DrawCursor(0.0f, zero);
-			}
-
-			// Determine the length of a typical string for resizing purpose
-
-			RECT r;
-			GetWindowRect(GetGraphWnd(hGraph), &r);
-			txtlen = (float)dispStringWidth.cx / r.right; // Normalize the width of the Y value characters between [0-1]
-			txtheight = (float)dispStringWidth.cy / r.bottom;
-
-			//Xmin
-
-			DrawString(-txtlen / 1.2f, -0.05f, ftos(value, sizeof(value), SnapPlot->Xmin));
-
-			//Xmax
-
-			DrawString(1 - txtlen / 1.2f, -0.05f, ftos(value, sizeof(value), SnapPlot->Xmax));
-
-			//Time (s)
-
-			DrawString(0.5f - (txtlen / 2.0f), -0.05f, Xname);
-
-			// Ymin to Ymax values
-
-			for (float ytmp = 0.0f; ytmp <= 1.0f; ytmp += 1.0f / div)
-			{
-				DrawString(-txtlen * 1.8f, ytmp - ((txtheight * 0.8f) / 2.0f), ftos(value, sizeof(value), reelval));
-				reelval += (SnapPlot->Ymax - SnapPlot->Ymin) / div;
-			}
-		}
-		LeaveCriticalSection(&cs);
-		SwapBuffers(GetGraphDC(hGraph));
+		printf("[!] Error at Render() graph handle is null\n");
+		return FALSE;
 	}
-	else if (pgraph->cur_nbpoints == 0 && start == 0.0f)														// Display a void graph when app start only
+
+	if (NULL == pgraph->hGraphWnd)
 	{
-		char value[32];
-		char Xname[] = "Time (s)";
-		float txtlen = 0.0;
-		float txtheight = 0.0;
-		RECT r;
+		printf("[!] Error at Render() graph windows is null\n");
+		return FALSE;
+	}
+
+	RECT r;
+	const int div = 10;
+	float txtlen = 0.0;
+	float txtheight = 0.0;
+	char value[260];
+	const char Xname[] = "Time (s)";
+	double reelval = SnapPlot->Ymin;
+
+	EnterCriticalSection(&cs);
+
+	if (pgraph->cur_nbpoints == 0 && start == 0.0f)														// Display a void graph when app start only
+	{
 		SnapPlot->Xmin = 0.0f;
 		SnapPlot->Xmax = 1.0f;
 		SnapPlot->Ymin = 0.0f;
 		SnapPlot->Ymax = 1.0f;
-		GetClientRect(pgraph->hGraphWnd, &DispArea);
+	}
+	else if (pgraph->cur_nbpoints > 0)
+	{	
+		UpdateBorder(hGraph);																			// border determination for each signal: meaning finding X and Y min max values																		
+		ZeroObject(SnapPlot, GetBufferSize(hGraph));													// Clear SnapPlot
+		FindGlobalMaxScale(hGraph, SnapPlot->Xmin, SnapPlot->Xmax, SnapPlot->Ymin, SnapPlot->Ymax);		// Load the Y min and max of all the signals in SnapPlot
+		normalize_data(hGraph, SnapPlot->Xmin, SnapPlot->Xmax, SnapPlot->Ymin, SnapPlot->Ymax);			// normalize between [0;1]
+	}
 
-			// Use the Projection Matrix
+	GetClientRect(pgraph->hGraphWnd, &DispArea);
 
-		glMatrixMode(GL_PROJECTION);
+		// Use the Projection Matrix
 
-			// Reset Matrix
+	glMatrixMode(GL_PROJECTION);
 
-		glLoadIdentity();
+		// Reset Matrix
 
-			// Set the correct perspective.
+	glLoadIdentity();
 
-		gluOrtho2D(-0.08, 1.04, 0 - 0.08, 1 + 0.02);
-		glViewport(0, 0, DispArea.right, DispArea.bottom);
+		// Set the correct perspective.
 
-			// Use the Projection Matrix
+	//gluOrtho2D(-0.08, 1.04, 0 - 0.08, 1 + 0.02);
 
-		glMatrixMode(GL_MODELVIEW);
+	const float orthoLeft = -0.08f; const float orthoRight = 1.04f;
+	const float orthoBottom = -0.08f; const float orthoTop = 1.02f;
+	gluOrtho2D(orthoLeft, orthoRight, orthoBottom, orthoTop);
 
-			// Reset Matrix
+	glViewport(0, 0, DispArea.right, DispArea.bottom);
 
-		glLoadIdentity();
+		// Use the Model Matrix
 
-			// Clear Color and Depth Buffers
+	glMatrixMode(GL_MODELVIEW);
 
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		// Reset Matrix
 
-			// to run once
+	glLoadIdentity();
 
-		glClear(GL_COLOR_BUFFER_BIT);
-		DrawGraphSquare();
-		DrawGridLines();
+		// Clear Color and Depth Buffers
+
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		// Draw graph frame and grid
+
+	DrawGraphSquare();
+	DrawGridLines();
+
+	if (SnapPlot->Ymax != SnapPlot->Ymin)
+	{
+
+			// draw points
+	
+		DrawWave(hGraph);
 
 			// draw indicators
 
 		glColor3f(0.1f, 0.1f, 0.1f);
 
-			// zero
+			// draw zero cursor
 
-		float zero = GetStandardizedData(0, SnapPlot->Ymin, SnapPlot->Ymax);
+		double zero = GetStandardizedData(0, SnapPlot->Ymin, SnapPlot->Ymax);
 		if (zero > 0 && zero < 1)
 		{
-			//DrawString(-0.05, zero, (char*)"0");
-			DrawCursor(0.0f, zero);
+			DrawString(-0.02f, (float)zero - 0.01f, (char*)"0");
+			DrawCursor(0.0f, (float)zero);
 		}
 
 			// Determine the length of a typical string for resizing purpose
 
 		GetWindowRect(GetGraphWnd(hGraph), &r);
-		txtlen = (float)dispStringWidth.cx / r.right; // Normalize the width of the Y value characters between [0-1]
+		txtlen = (float)dispStringWidth.cx / r.right; // Normalize the width of the printed value characters between [0-1]
 		txtheight = (float)dispStringWidth.cy / r.bottom;
 
 			//Xmin
 
-		DrawString(-txtlen / 1.2f, -0.05f, ftos(value, sizeof(value), SnapPlot->Xmin));
+		DrawString(-txtlen / 1.2f, -0.05f, dtos(value, sizeof(value), SnapPlot->Xmin));
 
 			//Xmax
 
-		DrawString(1 - txtlen / 1.2f, -0.05f, ftos(value, sizeof(value), SnapPlot->Xmax));
+		DrawString(1 - txtlen / 1.2f, -0.05f, dtos(value, sizeof(value), SnapPlot->Xmax));
 
 			//Time (s)
 
-		DrawString(0.5f - (txtlen / 2.0f), -0.05f, Xname);
+		DrawString(0.5f - (txtlen / 2.0f), -0.05f, (char*)Xname);
 
 			// Ymin to Ymax values
 
-		float reelval = SnapPlot->Ymin;
-		int div = 5;
-		for (float ytmp = 0.0f; ytmp <= 1.0f; ytmp += 1.0f / div)
+		for (float ytmp = 0.0; ytmp <= 1.1; ytmp += 1.0 / (float)div)
 		{
-			DrawString(-txtlen * 1.8f, ytmp - ((txtheight * 0.8f) / 2.0f), ftos(value, sizeof(value), reelval));
-			reelval += (SnapPlot->Ymax - SnapPlot->Ymin) / div;
+			DrawString(-txtlen * 1.5f, ytmp - ((txtheight * 0.8f) / 2.0f), dtos(value, sizeof(value), reelval));
+			reelval += (SnapPlot->Ymax - SnapPlot->Ymin) / (float)div;
 		}
-		SwapBuffers(GetGraphDC(hGraph));
 	}
+
+		// Display cursor with values if hoover
+
+	if (pgraph->bDisplayCursor)
+	{
+		//DisplayPointer(hGraph);
+
+		if (isMouseHover(hGraph))
+		{
+			POINT pos = GetMousePosition();
+			/////////////////////////////
+			RECT client;
+			HWND hwndGraph = NULL;
+			hwndGraph = GetGraphWnd(hGraph);
+			if (GetWindowRect(hwndGraph, &client))
+			{
+				// Normalization [0-1] on client area
+				// Xnorm = (X - min) / (max - min);
+				float normal_pos_x = ((float)pos.x - (float)client.left) / ((float)client.right - (float)client.left);
+				float normal_pos_y = ((float)pos.y - (float)client.bottom) / ((float)client.top - (float)client.bottom);
+			
+				// Normalization [0-1] on graph area
+				float normal_pos_x_shifted = ((float)normal_pos_x - (float)0.07) / ((float)0.965 - (float)0.07);
+				float normal_pos_y_shifted = ((float)normal_pos_y - (float)0.07) / ((float)0.98 - (float)0.07);
+
+				if ((normal_pos_y_shifted < 1.0f) && (normal_pos_y_shifted > 0.0f))
+				{
+					if ((normal_pos_x_shifted < 1.0f) && (normal_pos_x_shifted > 0.0f))
+					{
+						// Display X indicator
+
+						//DrawString(normal_pos_x, normal_pos_y - 0.05, dtos(value, sizeof(value), (normal_pos_x_shifted * (SnapPlot->Xmax - SnapPlot->Xmin)) + SnapPlot->Xmin));
+
+						// Display Y indicator
+
+						double dy = 0.0;
+						dy = (SnapPlot->Ymin - SnapPlot->Ymax) * (1 - normal_pos_y_shifted);
+						dy = SnapPlot->Ymax + dy;
+						DrawString(normal_pos_x + 0.05, normal_pos_y - 0.05, dtos(value, sizeof(value), dy));
+
+						printf("x=%lf	y=%lf	xnorm=%lf	ynorm=%lf\n", normal_pos_x, normal_pos_y, normal_pos_x_shifted, normal_pos_y_shifted);
+
+						// Display lines indicator
+
+						/*
+						glColor3f(0.0f, 1.0f, 0.5f);
+						glBegin(GL_LINE_STRIP);
+						glVertex2f(0, 0);
+						glVertex2f(normal_pos_x_shifted, normal_pos_y_shifted);
+						glEnd();
+						*/
+						glColor3f(0.0f, 0.4f, 0.5f);
+						glBegin(GL_LINE_STRIP);
+						glVertex2f(0, normal_pos_y_shifted);
+						glVertex2f(1, normal_pos_y_shifted);
+						glEnd();
+
+						glBegin(GL_LINE_STRIP);
+						glVertex2f(normal_pos_x_shifted, 0);
+						glVertex2f(normal_pos_x_shifted, 1);
+						glEnd();
+
+						// OK
+						//DrawString(normal_pos_x, normal_pos_y - 0.05, dtos(value, sizeof(value), (normal_pos_x * (SnapPlot->Xmax - SnapPlot->Xmin)) + SnapPlot->Xmin));
+
+
+						//~OK
+						//double dy = 0.0;
+						//dy = (SnapPlot->Ymin - SnapPlot->Ymax)* (1-normal_pos_y);
+						//dy = SnapPlot->Ymax + dy;
+						//printf("dy:%lf, ymin:%lf ymax%lf\n", dy, SnapPlot->Ymin, SnapPlot->Ymax);
+
+
+						// OK
+						//DrawString(normal_pos_x + 0.05, normal_pos_y - 0.05, dtos(value, sizeof(value), dy));
+					}
+				}
+			}
+		}
+	}
+	LeaveCriticalSection(&cs);
+	SwapBuffers(GetGraphDC(hGraph));
 	return TRUE;
 }
 
@@ -1015,6 +1827,14 @@ BOOL Render(HGRAPH hGraph)
 
 VOID ReshapeGraph(HGRAPH hGraph, int left, int top, int right, int bottom)
 {
+		// Sanity check
+
+	if (NULL == hGraph)
+	{
+		printf("[!] Error at ReshapeGraph() graph handle is null\n");
+		return;
+	}	
+
 	HWND hitem = GetGraphWnd(hGraph);
 	if (SetWindowPos(hitem, NULL, left, top, right, bottom, SWP_SHOWWINDOW))
 	{
@@ -1032,8 +1852,20 @@ VOID ReshapeGraph(HGRAPH hGraph, int left, int top, int right, int bottom)
 
 VOID InitGL(HGRAPH hGraph, int Width, int Height)		// Called after the main window is created
 {
-	glShadeModel(GL_SMOOTH);							// Enable Smooth Shading
-	if (!BuildMyFont(hGraph, (char*)"Verdana", 12))// Build The Font BuildMyFont(HGRAPH hGraph, char* FontName, int Fontsize)
+		// Sanity check
+
+	if (NULL == hGraph)
+	{
+		printf("[!] Error at InitGL() graph handle is null\n");
+		return;
+	}
+
+	//glShadeModel(GL_SMOOTH);							// Enable Smooth drawing MSAA...
+	//glEnable(GL_LINE_SMOOTH);							// Enable Smooth drawing MSAA...
+	//glEnable(GL_BLEND);
+	glDepthMask(false);
+
+	if (!BuildMyFont(hGraph, (char*)"Verdana", 12))		// Build The Font BuildMyFont(HGRAPH hGraph, char* FontName, int Fontsize)
 	{
 		// error on creating the Font
 	}
@@ -1060,12 +1892,21 @@ BOOL BuildMyFont(HGRAPH hGraph, char * FontName, int Fontsize)
 	HFONT hCustomFont = NULL;									// New font to create
 	HFONT hCurrentFont = NULL;									// Store the current Windows font
 
+		// Sanity check
+
+	if (NULL == hGraph)
+	{
+		printf("[!] Error at BuildMyFont() graph handle is null\n");
+		return FALSE;
+	}
+
 	// Create an empty display list of 96 char (We are using ASCII char from 32 to 127 only)
 
 	base = glGenLists(96);	
 	if (0 == base)
 	{
 		// error when generate the empty list
+		printf("[!] Error at BuildMyFont() with code: 0x%x\nerror when generate the empty list\n", GetLastError());
 		return FALSE;
 	}
 
@@ -1087,23 +1928,26 @@ BOOL BuildMyFont(HGRAPH hGraph, char * FontName, int Fontsize)
 	if (NULL == hCustomFont)
 	{
 		// error when creating the font
+		printf("[!] Error at BuildMyFont() with code: 0x%x\nerror when creating the font\n", GetLastError());
 		return FALSE;
 	}
 
-	hCurrentFont = (HFONT)SelectObject(GetGraphDC(hGraph), hCustomFont);// Select the custom Font and store the current font
+	hCurrentFont = (HFONT)SelectObject(GetGraphDC(hGraph), hCustomFont);	// Select the custom Font and store the current font
 
-	if (!wglUseFontBitmaps(GetGraphDC(hGraph), 32, 96, base))		// Builds 96 Characters Starting At Character 32 and store it in the list
+	if (!wglUseFontBitmaps(GetGraphDC(hGraph), 32, 96, base))				// Builds 96 Characters Starting At Character 32 and store it in the list
 	{
 		// error when loading the font
+		printf("[!] Error at BuildMyFont() with code: 0x%x\nerror when loading the font\n", GetLastError());
 		return FALSE;
 	}
-	char text[] = "-0.0000";
+	const char text[] = "-0.0000";
 	SetTextCharacterExtra(GetGraphDC(hGraph), 1);
 	GetTextExtentPoint32A(GetGraphDC(hGraph), text, strlen(text), &dispStringWidth);
 	dispStringWidth.cx -= GetTextCharacterExtra(GetGraphDC(hGraph)) * (strlen(text) - 2);
 
-	SelectObject(GetGraphDC(hGraph), hCurrentFont);				// restore the initial Font
-	DeleteObject(hCustomFont);									// We don't need the Custom Font anymore as we populate the list and load it in OpenGL
+	SelectObject(GetGraphDC(hGraph), hCurrentFont);							// restore the initial Font
+	DeleteObject(hCustomFont);												// We don't need the Custom Font anymore as we populate the list and load it in OpenGL
+	return TRUE;
 }
 
 /*-------------------------------------------------------------------------
@@ -1141,34 +1985,92 @@ GLvoid glPrint(const char* fmt, ...)										// Custom GL "Print" Routine
 	FindGlobalMaxScale: Scanning arrays to determine the border
   -------------------------------------------------------------------------*/
 
-BOOL FindGlobalMaxScale(HGRAPH hGraph, float& Xmin, float& Xmax, float& Ymin, float& Ymax)
+BOOL FindGlobalMaxScale(HGRAPH hGraph, double& Xmin, double& Xmax, double& Ymin, double& Ymax)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at FindGlobalMaxScale() graph handle is null\n");
+		return FALSE;
+	}
+
 	if (0 != pgraph->signalcount)
 	{
-		
-		Xmin = pgraph->signal[0]->Xmin;										// save first value
-		Xmax = pgraph->signal[0]->Xmax;										// save first value	
-		Ymin = pgraph->signal[0]->Ymin;										// save first value
-		Ymax = pgraph->signal[0]->Ymax;										// save first value
-
-
-		for (int index = 1; index < pgraph->signalcount; index++)			// Iterate
+		int first_sig = 0;
+		for (int index = 0; index < pgraph->signalcount; index++)			// find first displayed signal (show=true)
 		{
-			if (Xmin > pgraph->signal[index]->Xmin)
-				Xmin = pgraph->signal[index]->Xmin;							// Update if needed
-
-			if (Xmax < pgraph->signal[index]->Xmax)
-				Xmax = pgraph->signal[index]->Xmax;							// Update if needed
-
-			if (Ymin > pgraph->signal[index]->Ymin)
-				Ymin = pgraph->signal[index]->Ymin;							// Update if needed
-
-			if (Ymax < pgraph->signal[index]->Ymax)
-				Ymax = pgraph->signal[index]->Ymax;							// Update if needed
+			if (pgraph->signal[index]->show == false)
+			{
+				continue;
+			}
+			else
+			{
+				first_sig = index;											// save first signal number
+				break;
+			}
 		}
-		return TRUE;
+		
+		Xmin = pgraph->signal[first_sig]->Xmin;										// save first value
+		Xmax = pgraph->signal[first_sig]->Xmax;										// save first value	
+		Ymin = pgraph->signal[first_sig]->Ymin;										// save first value
+		Ymax = pgraph->signal[first_sig]->Ymax;										// save first value
+
+
+		for (int index = first_sig+1; index < pgraph->signalcount; index++)			// Iterate every signals
+		{
+			if (pgraph->signal[index]->show == true)						// Update limit only if signal displayed
+			{
+				if (Xmin > pgraph->signal[index]->Xmin)
+					Xmin = pgraph->signal[index]->Xmin;							// Update if needed
+
+				if (Xmax < pgraph->signal[index]->Xmax)
+					Xmax = pgraph->signal[index]->Xmax;							// Update if needed
+
+				if (Ymin > pgraph->signal[index]->Ymin)
+					Ymin = pgraph->signal[index]->Ymin;							// Update if needed
+
+				if (Ymax < pgraph->signal[index]->Ymax)
+					Ymax = pgraph->signal[index]->Ymax;							// Update if needed
+			}
+		}
+		
+			// prevent div by 0
+
+		if ((Ymax - Ymin) == 0)
+		{
+			Ymax += 0.5;
+			Ymin -= 0.5;
+		}
+
+			// Optimize display with rounded units
+
+		const double rangeMult[] = { /*0.1, 0.2, 0.25, 0.5, 1.0, */2.0, 2.5, 5.0};
+		const int segnumber = 10;
+		double magnitude = floor(log10(Ymax - Ymin));
+		
+		for (int i = 0; i < sizeof(rangeMult) / sizeof(double); i++)
+		{
+			double step_size = rangeMult[i] * pow(10, magnitude);
+			double low = floor(Ymin / step_size) * step_size;
+			double high = ceil(Ymax / step_size) * step_size;
+
+			double segment = round((high - low) / step_size);
+
+			if (segment <= segnumber)
+			{
+				Ymax = high;
+				Ymin = low;
+				return TRUE;
+			}
+		}
+		printf("[!] Error at FindGlobalMaxScale()\nimpossible to calculate good proportion with the algorythm\n");
+		return FALSE;
+		
 	}
+	printf("[!] Error at FindGlobalMaxScale()\nsignal count  = 0\n");
 	return FALSE;
 }
 
@@ -1181,45 +2083,45 @@ BOOL FindGlobalMaxScale(HGRAPH hGraph, float& Xmin, float& Xmax, float& Ymin, fl
 VOID DrawWave(HGRAPH hGraph)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
-	DATA* pDATA;
-	glLineWidth(2);
 
-	// Color map
+		// Sanity check
 
-	float COLORS[16][3] =
+	if (NULL == pgraph)
 	{
-		{0.1f, 0.15f, 0.15f},
-		{0.5f, 0.15f, 0.15f},
-		{1.0f, 0.15f, 0.15f},
-		{0.1f, 0.5f, 0.15f},
-		{0.1f, 0.5f, 0.9f},
-		{0.9f, 0.5f, 0.15f},
-		{0.1f, 0.15f, 0.5f},
-		{0.1f, 0.9f, 0.15f},
-		{0.9f, 0.15f, 0.15f},
-		{0.1f, 0.15f, 0.15f},
-		{0.1f, 0.4f, 0.15f},
-		{0.1f, 0.15f, 0.15f},
-		{0.1f, 0.7f, 0.15f},
-		{0.1f, 0.15f, 0.15f},
-		{0.8f, 0.15f, 0.15f},
-		{0.1f, 0.8f, 0.8f}
-	};
+		printf("[!] Error at DrawWave() graph handle is null\n");
+		return;
+	}
 
-	for (int index = 0; index < pgraph->signalcount; index++)
+	if (pgraph->cur_nbpoints > 0)
 	{
-		pDATA = pgraph->signal[index];
-		glColor3f(COLORS[index][0], COLORS[index][1], COLORS[index][2]); // Colors of the signal
-		glBegin(GL_LINE_STRIP);
-		for (int i = 0; i < pgraph->cur_nbpoints; i++)
+		DATA* pDATA;
+		glLineWidth(1.5);
+
+		for (int index = 0; index < pgraph->signalcount; index++)
 		{
-			// prevent NAN
-			if (pDATA->Xnorm[i] != pDATA->Xnorm[i] || pDATA->Ynorm[i] != pDATA->Ynorm[i])
+			pDATA = pgraph->signal[index];
+			if (pDATA->show == false)																	// Skip signal display if requiered
+			{
 				continue;
+			}
+			glColor3f(pDATA->color[0], pDATA->color[1], pDATA->color[2]);								// Colors of the signal
+			glBegin(GL_LINE_STRIP);
 
-			glVertex2f(TakeFiniteNumber(pDATA->Xnorm[i]), TakeFiniteNumber(pDATA->Ynorm[i])); // Create the curve in memory
+			int first_point = pgraph->cur_nbpoints - (pgraph->cur_nbpoints / GetZoomFactor(hGraph));	// first_point [0-cur_nbpoints]
+			if (first_point < 0)
+				first_point = 0;
+
+			for (int i = first_point; i < pgraph->cur_nbpoints; i++)	// Handle zoom here
+			{
+					// prevent NAN
+
+				if (pDATA->Xnorm[i] != pDATA->Xnorm[i] || pDATA->Ynorm[i] != pDATA->Ynorm[i])
+					continue;
+
+				glVertex2f(TakeFiniteNumber(pDATA->Xnorm[i]), TakeFiniteNumber(pDATA->Ynorm[i]));		// Create GPU wave
+			}
+			glEnd();
 		}
-		glEnd();
 	}
 }
 
@@ -1239,7 +2141,7 @@ VOID DrawString(float x, float y, char* string)
 
 VOID DrawGraphSquare(VOID)
 {
-	// Set boxing
+		// Set boxing
 
 	glLineWidth(3);
 	glColor3f(0.0f, 0.0f, 0.0f);
@@ -1251,14 +2153,21 @@ VOID DrawGraphSquare(VOID)
 	glVertex2i(0, 0);
 	glEnd();
 
-	// Set colored font rectangle
+		// Set colored font rectangle
 
-	glColor3f(0.988f, 0.99f, 1.0f);
 	glBegin(GL_POLYGON);
+	glColor3f(0.988f, 0.988f, 0.988f);
 	glVertex2i(0, 0);
+
+	glColor3f(0.888f, 0.888f, 0.890f);
 	glVertex2i(0, 1);
+
+	glColor3f(0.888f, 0.888f, 0.890f);
 	glVertex2i(1, 1);
+
+	glColor3f(0.988f, 0.988f, 0.988f);
 	glVertex2i(1, 0);
+
 	glEnd();
 }
 
@@ -1268,10 +2177,10 @@ VOID DrawGraphSquare(VOID)
 
 VOID DrawGridLines(VOID)
 {
-	// Draw fine grid 
+		// Draw fine grid 
 
 	glLineWidth(0.5);
-	glColor3f(0.5F, 0.5F, 0.5F);
+	glColor3f(0.8F, 0.8F, 0.8F);
 	glBegin(GL_LINES);
 	for (float xtmp = 0.0f; xtmp < 1.0f; xtmp += 0.05f)
 	{
@@ -1282,10 +2191,10 @@ VOID DrawGridLines(VOID)
 	};
 	glEnd();
 
-	//Draw Grid 
+		//Draw Grid 
 
 	glLineWidth(1);
-	glColor3f(0.3F, 0.1F, 0.0F);
+	glColor3f(0.5F, 0.5F, 0.5F);
 	glBegin(GL_LINES);
 	for (float xtmp = 0.0f; xtmp < 1.0f; xtmp += 0.20f)
 	{
@@ -1317,18 +2226,18 @@ VOID DrawCursor(float x, float y)
 	+-INF value. A rounding happen here
   -------------------------------------------------------------------------*/
 
-inline float TakeFiniteNumber(float x)
+inline double TakeFiniteNumber(double x)
 {
 	// used to prevent -INF && +INF for computation
 	// always return a real value closest to the limit
 
-	if (x <= -FLT_MAX)
+	if (x <= -DBL_MAX)
 	{
-		return -FLT_MAX;
+		return -DBL_MAX;
 	}
-	if (x >= +FLT_MAX)
+	if (x >= +DBL_MAX)
 	{
-		return FLT_MAX;
+		return DBL_MAX;
 	}
 	return x;
 }
@@ -1338,7 +2247,7 @@ inline float TakeFiniteNumber(float x)
 	finite number
   -------------------------------------------------------------------------*/
 
-float FindFirstFiniteNumber(float* tab, int length)
+double FindFirstFiniteNumber(double* tab, int length)
 {
 	int i = 0;
 	do
@@ -1356,9 +2265,23 @@ float FindFirstFiniteNumber(float* tab, int length)
 	ftos: format a float value to a str representation
   -------------------------------------------------------------------------*/
 
-LPSTR ftos(LPSTR str, int len, float value)
+LPSTR dtos(LPSTR str, int len, double value)
 {
-	sprintf_s(str, len, "%.1lf", value);
+	
+
+	if (value < 1.0 && value > -1.0)
+	{	
+		sprintf_s(str, len, "%.3lf", value);
+	}
+	else if (value < 10.0 && value > -10.0)
+	{
+		sprintf_s(str, len, "%.2lf", value);
+	}
+	else
+	{
+		sprintf_s(str, len, "%.1lf", value);
+	}
+	
 	return str;
 }
 
@@ -1367,9 +2290,9 @@ LPSTR ftos(LPSTR str, int len, float value)
 	the normalized data space [0;1]
   -------------------------------------------------------------------------*/
 
-float GetStandardizedData(float X, float min, float max)
+double GetStandardizedData(double X, double min, double max)
 {
-	float ret;
+	double ret;
 	ret = (X - min) / (max - min);
 	// initial value = (max - X) / (max - min);
 	return ret;
@@ -1380,9 +2303,18 @@ float GetStandardizedData(float X, float min, float max)
 	be set between the range of 0 and 1 after executing.
   -------------------------------------------------------------------------*/
 
-VOID normalize_data(HGRAPH hGraph, float Xmin, float Xmax, float Ymin, float Ymax)
+VOID normalize_data(HGRAPH hGraph, double Xmin, double Xmax, double Ymin, double Ymax)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at normalize_data() graph handle is null\n");
+		return;
+	}
+
 	for (int index = 0; index < pgraph->signalcount; index++)
 	{
 		for (int x = 0; x < pgraph->cur_nbpoints; x++)
@@ -1399,9 +2331,9 @@ VOID normalize_data(HGRAPH hGraph, float Xmin, float Xmax, float Ymin, float Yma
 			pgraph->signal[index]->Ynorm[x] = (pgraph->signal[index]->Y[x] - Ymin) / (Ymax - Ymin);
 
 			// prevent Nan numbers in normalized buffer
+			
 			////////////////////////////////////////////////////////////////////////////////!
-			// Error prone = 0.0
-
+			// Error prone = 0.0 in place of +inf or -inf
 			if (pgraph->signal[index]->Ynorm[x] != pgraph->signal[index]->Ynorm[x])
 				pgraph->signal[index]->Y[x] = 0.0;
 
@@ -1417,6 +2349,15 @@ VOID normalize_data(HGRAPH hGraph, float Xmin, float Xmax, float Ymin, float Yma
 VOID UpdateBorder(HGRAPH hGraph)
 {
 	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+		// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at UpdateBorder() graph handle is null\n");
+		return;
+	}
+
 	static int AnalizedPts;
 	static int CurrentPoint = 0;
 	/// ////////////////////////////////////////////
@@ -1434,12 +2375,26 @@ VOID UpdateBorder(HGRAPH hGraph)
 		ymaxpos = 0;
 		runonce++;
 	}
-	printf("\rAnalizedPts%i xmax%i ymin%i ymax%i", AnalizedPts, xmaxpos, yminpos, ymaxpos);
-	if (yminpos < 0 || ymaxpos < 0 || yminpos > pgraph->cur_nbpoints/10 || ymaxpos > pgraph->cur_nbpoints/10)
+	//fprintf("\rAnalizedPts%i xmax%i ymin%i ymax%i", AnalizedPts, xmaxpos, yminpos, ymaxpos);
+	if (yminpos < 0 || ymaxpos < 0 || yminpos > pgraph->cur_nbpoints/20 || ymaxpos > pgraph->cur_nbpoints/20)
 	{
-		AnalizedPts = 0;
+		int zoom = GetZoomFactor(hGraph);
+		if (zoom > 0)
+		{
+			int low = pgraph->cur_nbpoints - (pgraph->cur_nbpoints / zoom);
+			//printf("\r\nlower point analysed: %i", low);
+			AnalizedPts = low;
+		}
+		else
+			AnalizedPts = 0;
+
+		//AnalizedPts = 0;
 		for (int index = 0; index <= pgraph->signalcount - 1; index++)
 		{
+			if (pgraph->signal[index]->show == false)
+			{
+				continue;
+			}
 			pgraph->signal[index]->Xmin = TakeFiniteNumber(pgraph->signal[index]->X[AnalizedPts]);
 			pgraph->signal[index]->Xmax = TakeFiniteNumber(pgraph->signal[index]->X[AnalizedPts]);
 			//pgraph->BufferSize = 50;
@@ -1477,6 +2432,10 @@ VOID UpdateBorder(HGRAPH hGraph)
 	{
 		for (int index = 0; index <= pgraph->signalcount - 1; index++)
 		{
+			if (pgraph->signal[index]->show == false)
+			{
+				continue;
+			}
 			pgraph->signal[index]->Xmin = TakeFiniteNumber(pgraph->signal[index]->X[AnalizedPts]);
 			pgraph->signal[index]->Xmax = TakeFiniteNumber(pgraph->signal[index]->X[AnalizedPts]);
 			pgraph->signal[index]->Ymin = TakeFiniteNumber(pgraph->signal[index]->Y[AnalizedPts]);
@@ -1488,12 +2447,16 @@ VOID UpdateBorder(HGRAPH hGraph)
 	{
 		for (int index = 0; index <= pgraph->signalcount - 1; index++)
 		{
-		
+			if (pgraph->signal[index]->show == false)
+			{
+				continue;
+			}
 			CurrentPoint = AnalizedPts;
 		
 			for (CurrentPoint; CurrentPoint < pgraph->cur_nbpoints; CurrentPoint++)
 			{
-				pgraph->signal[index]->Xmin = TakeFiniteNumber(pgraph->signal[index]->X[0]);
+				pgraph->signal[index]->Xmin = TakeFiniteNumber(pgraph->signal[index]->X[AnalizedPts]);
+				//pgraph->signal[index]->Xmin = TakeFiniteNumber(pgraph->signal[index]->X[0]);
 
 				if (TakeFiniteNumber(pgraph->signal[index]->X[CurrentPoint]) > pgraph->signal[index]->Xmax)
 				{
@@ -1504,12 +2467,12 @@ VOID UpdateBorder(HGRAPH hGraph)
 				if (TakeFiniteNumber(pgraph->signal[index]->Y[CurrentPoint]) < pgraph->signal[index]->Ymin)
 				{
 					pgraph->signal[index]->Ymin = TakeFiniteNumber(pgraph->signal[index]->Y[CurrentPoint]);
-					yminpos = CurrentPoint;
+					yminpos = CurrentPoint;										
 				}
 					
 				if (TakeFiniteNumber(pgraph->signal[index]->Y[CurrentPoint]) > pgraph->signal[index]->Ymax)
 				{
-					pgraph->signal[index]->Ymax = TakeFiniteNumber(pgraph->signal[index]->Y[CurrentPoint]);
+					pgraph->signal[index]->Ymax = TakeFiniteNumber(pgraph->signal[index]->Y[CurrentPoint]); 
 					ymaxpos = CurrentPoint;
 				}	
 			}
@@ -1528,36 +2491,134 @@ VOID UpdateBorder(HGRAPH hGraph)
 	/// ////////////////////////////////////////////
 }
 
-VOID ZeroObject(HGRAPH hGraph, DATA *pDATA)
-{
-	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+/*-------------------------------------------------------------------------
+	ZeroObject: Reset DATA structure to 0
+-------------------------------------------------------------------------*/
 
-	memset(pDATA->X, 0, sizeof(float) * pgraph->BufferSize);
-	memset(pDATA->Y, 0, sizeof(float) * pgraph->BufferSize);
-	memset(pDATA->Xnorm, 0, sizeof(float) * pgraph->BufferSize);
-	memset(pDATA->Ynorm, 0, sizeof(float) * pgraph->BufferSize);
+VOID ZeroObject(DATA *pDATA, INT iBufferSize)
+{
+		// Sanity check
+
+	if (NULL == pDATA)
+	{
+		printf("[!] Error at ZeroObject() pData ptr is null\n");
+		return;
+	}
+
+	memset(pDATA->X, 0, sizeof(double) * iBufferSize);
+	memset(pDATA->Y, 0, sizeof(double) * iBufferSize);
+	memset(pDATA->Xnorm, 0, sizeof(double) * iBufferSize);
+	memset(pDATA->Ynorm, 0, sizeof(double) * iBufferSize);
 	pDATA->Xmin = 0.0f;
 	pDATA->Xmax = 0.0f;
 	pDATA->Ymin = 0.0f;
 	pDATA->Ymax = 0.0f;
 }
 
-//https://www.pluralsight.com/blog/software-development/how-to-measure-execution-time-intervals-in-c--
+/*-------------------------------------------------------------------------
+	GetBufferSize: return the total data buffer size
+-------------------------------------------------------------------------*/
+
+INT GetBufferSize(HGRAPH hGraph)
+{
+	PGRAPHSTRUCT pgraph = (PGRAPHSTRUCT)hGraph;
+
+	// Sanity check
+
+	if (NULL == pgraph)
+	{
+		printf("[!] Error at GetBufferSize() graph handle is null\n");
+		return -1;
+	}
+	return pgraph->BufferSize;
+}
+
+/*-------------------------------------------------------------------------
+	GetUniqueFilename: return an unique filename for logging purpose
+-------------------------------------------------------------------------*/
+
+BOOL GetUniqueFilename(CHAR* lpFilename, CHAR* lpFileExtension)
+{
+	SYSTEMTIME t;
+
+		// get daily filename
+
+	char lpDateStr[MAX_PATH] = "";
+	char name_format[32] = "";
+	if (strlen(lpFileExtension) > 10)
+	{
+		printf("[!] Error at GetUniqueFilename() lpFileExtension > 10 char\n");
+		return FALSE;
+	}
+	sprintf_s(name_format, "yyyy_MMM_dd_%s", lpFileExtension);
+	GetLocalTime(&t);
+	int ok = GetDateFormat(LOCALE_USER_DEFAULT,
+		0,
+		&t,
+		name_format,
+		lpDateStr,
+		sizeof(lpDateStr));
+
+	CHAR lpBaseFilename[MAX_PATH] = "";
+	strcpy_s(lpBaseFilename, _countof(lpDateStr), lpDateStr);
+	strcpy_s(lpFilename, _countof(lpBaseFilename), lpBaseFilename);
+
+	int i = 0;
+try_next_file:
+	WIN32_FIND_DATA FindFileData;
+	HANDLE hFind = FindFirstFile(
+		lpFilename,
+		&FindFileData
+	);
+
+	if (hFind == INVALID_HANDLE_VALUE)
+	{
+		printf("[*] Make unique filename successfull: %s\n", lpFilename);
+		return TRUE;
+	}
+
+	// Build (0) str
+	char temp[6];
+	snprintf(temp, _countof(temp), "(%i)", i);
+
+	// Reset lpFilename with base file
+	strcpy_s(lpFilename, _countof(lpBaseFilename), lpBaseFilename);
+
+	// Remove extension .lab
+	int cut_offset = strlen(lpFilename) - strlen(lpFileExtension);
+	lpFilename[cut_offset] = '\0';
+
+	// Add (0)
+	strcat_s(lpFilename, _countof(lpBaseFilename), temp);
+
+	// Add extension
+	strcat_s(lpFilename, _countof(lpBaseFilename), lpFileExtension);
+
+	// Inc counter
+	i++;
+
+	// Max filenumber = 999
+	if(i<999)
+		goto try_next_file;
+
+
+	printf("[!] Make unique filename failed\n");
+	return FALSE;
+}
+
 inline long long PerformanceFrequency()
 {
 	LARGE_INTEGER li;
 	QueryPerformanceFrequency(&li);
 	return li.QuadPart;
 }
-//https://www.pluralsight.com/blog/software-development/how-to-measure-execution-time-intervals-in-c--
+
 inline long long PerformanceCounter()
 {
 	LARGE_INTEGER li;
 	QueryPerformanceCounter(&li);
 	return li.QuadPart;
 }
-
-
 
 /*-------------------------------------------------------------------------
 	CheckErr: try to catch openGL error messages
